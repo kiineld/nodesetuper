@@ -52,6 +52,10 @@ NODE_SUBDOMAIN="${NODE_SUBDOMAIN:-}"           # label only, e.g. "de1", or "@" 
 DNS_WAIT_SECONDS="${DNS_WAIT_SECONDS:-300}"    # how long to wait for the record to propagate
 BESZEL_PERMANENT_TOKEN="${BESZEL_PERMANENT_TOKEN:-no}"  # yes = persist the universal token on the hub
 SKIP_WARP="${SKIP_WARP:-no}"
+# Reuse WARP credentials from a machine where registration already worked.
+# Each accepts a local path, an http(s) URL, or the file's base64.
+WARP_ACCOUNT="${WARP_ACCOUNT:-}"   # wgcf-account.toml  — skips registration
+WARP_PROFILE="${WARP_PROFILE:-}"   # wgcf-profile.conf  — skips registration AND generate
 SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
 
 # Prompted for if still empty. Declared here so `set -u` never trips on a path
@@ -203,6 +207,10 @@ Usage: install-node.sh [key=value ...]
                           (bkey + btoken skip the hub login entirely)
   System     ipv6=        keep|disable               sshport=  default 2224
              skipwarp=    yes|no                     skipssh=  yes|no
+  WARP       warpprofile= reuse a wgcf-profile.conf (path, URL or base64)
+                          — needs no Cloudflare access at all
+             warpaccount= reuse a wgcf-account.toml; skips registration, but
+                          `wgcf generate` still calls the Cloudflare API
 
   Example:
     install-node.sh rpanelurl=https://panel.example.com sub=de1 name=DE-1
@@ -263,6 +271,8 @@ parse_args() {
             sshport)                                    set_var SSH_PORT "$val" ;;
             selfstealport)                              set_var SELFSTEAL_PORT "$val" ;;
             skipwarp|nowarp)                            set_var SKIP_WARP "$val" ;;
+            warpaccount|wgcfaccount|warpacct)           set_var WARP_ACCOUNT "$val" ;;
+            warpprofile|wgcfprofile|warpconf)           set_var WARP_PROFILE "$val" ;;
             skipsshport|skipssh)                        set_var SKIP_SSH_PORT "$val" ;;
             installdir)                                 set_var INSTALL_DIR "$val" ;;
             *) warn "unknown argument: ${arg%%=*}  (run with --help for the list)" ;;
@@ -1033,6 +1043,60 @@ register_node() {
     ok "registered as $NODE_NAME ($uuid)"
 }
 
+# Accept a local path, an http(s) URL, or raw base64, and land it at $2.
+# $3 is a regex the result must match, so a 404 page or a bad paste is caught
+# here rather than surfacing later as a confusing wireguard error.
+materialise_file() {  # materialise_file <source> <dest> <sanity regex>
+    local src=$1 dest=$2 needle=$3
+    if [[ -f "$src" ]]; then
+        cp -f "$src" "$dest" || return 1
+    elif [[ "$src" == http://* || "$src" == https://* ]]; then
+        curl -fsSL --max-time 30 "$src" -o "$dest" || return 1
+    else
+        printf '%s' "$src" | base64 -d > "$dest" 2>/dev/null || return 1
+    fi
+    if ! grep -qE "$needle" "$dest" 2>/dev/null; then
+        rm -f "$dest"
+        return 1
+    fi
+    chmod 600 "$dest"
+    return 0
+}
+
+# Install straight from a wgcf-profile.conf, doing by hand what warp-native does
+# after `wgcf generate`. This is the only path that needs no Cloudflare API call
+# at all, so it is what works on a fully blocked network.
+warp_install_from_profile() {
+    local conf=/etc/wireguard/warp.conf
+    if ! have wg-quick; then
+        info "installing wireguard"
+        apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools >/dev/null 2>&1 || {
+            soft_fail "could not install wireguard"; return 1; }
+    fi
+    mkdir -p /etc/wireguard
+    if ! materialise_file "$WARP_PROFILE" "$conf" '^\[Interface\]'; then
+        soft_fail "supplied WARP profile is not a readable wgcf-profile.conf"
+        return 1
+    fi
+
+    # Same edits warp-native applies to the generated profile.
+    sed -i '/^DNS =/d' "$conf"
+    grep -q 'Table = off' "$conf" || sed -i '/^MTU =/aTable = off' "$conf"
+    grep -q 'PersistentKeepalive = 25' "$conf" || sed -i '/^Endpoint =/aPersistentKeepalive = 25' "$conf"
+    sed -i 's/,[[:space:]]*[0-9a-fA-F:]\+\/128//' "$conf"
+    sed -i '/Address = [0-9a-fA-F:]\+\/128/d' "$conf"
+    chmod 600 "$conf"
+
+    if ! systemctl enable --now wg-quick@warp >/dev/null 2>&1; then
+        soft_fail "wg-quick@warp failed to start — check: journalctl -u wg-quick@warp"
+        return 1
+    fi
+    ok "warp up from the supplied profile"
+    warn "this profile is one Cloudflare device; reusing it on several servers at"
+    warn "once may get the device dropped. Register per-node when you can."
+    return 0
+}
+
 install_warp() {
     if [[ "${SKIP_WARP,,}" == "yes" ]]; then
         step "WARP"; info "skipped (SKIP_WARP=yes)"; return 0
@@ -1041,6 +1105,28 @@ install_warp() {
     if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
         ok "already active"
         return 0
+    fi
+
+    # A ready-made profile bypasses Cloudflare entirely.
+    if [[ -n "$WARP_PROFILE" ]]; then
+        info "using the supplied wgcf-profile.conf — no Cloudflare API needed"
+        warp_install_from_profile
+        return $?
+    fi
+
+    # warp-native does `cd "$HOME"` and skips registration when this file is
+    # already there, so dropping one in is all it takes.
+    local warp_home="${HOME:-/root}" acct
+    acct="${warp_home}/wgcf-account.toml"
+    if [[ -f "$acct" ]]; then
+        info "existing $acct found — registration will be skipped"
+    elif [[ -n "$WARP_ACCOUNT" ]]; then
+        if materialise_file "$WARP_ACCOUNT" "$acct" 'private_key'; then
+            ok "installed the supplied wgcf-account.toml"
+        else
+            soft_fail "supplied WARP account is not a readable wgcf-account.toml"
+            return 1
+        fi
     fi
     # The installer asks three questions: language, WARP+ licence, watchdog
     # interval. Empty answers take the defaults (English / free / 10 min).
@@ -1063,14 +1149,26 @@ install_warp() {
 
     if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
         ok "warp tunnel up"
-    else
-        soft_fail "warp tunnel is not active"
-        warn "wgcf registers against api.cloudflareclient.com, which is commonly"
-        warn "blocked or throttled from RU networks — that is the usual cause of"
-        warn "the TLS handshake timeout. Options: re-run 'warp' later from a host"
-        warn "with a route to it, or pass skipwarp=yes to stop trying."
-        return 1
+        return 0
     fi
+
+    soft_fail "warp is not active — skipping, everything else is unaffected"
+    warn "wgcf talks to api.cloudflareclient.com, which is commonly blocked from"
+    warn "RU networks; that is what the TLS handshake timeout means."
+    warn ""
+    warn "To finish this later, copy from a machine where WARP already works:"
+    warn ""
+    warn "  # fully offline — the reliable one, needs no Cloudflare access:"
+    warn "  scp -P ${SSH_PORT} /etc/wireguard/warp.conf root@${NODE_DOMAIN}:/etc/wireguard/warp.conf"
+    warn "  ssh -p ${SSH_PORT} root@${NODE_DOMAIN} 'systemctl enable --now wg-quick@warp'"
+    warn ""
+    warn "  # or hand either file to this script on the next run:"
+    warn "  warpprofile=/etc/wireguard/warp.conf     # or a URL, or base64"
+    warn "  warpaccount=${warp_home}/wgcf-account.toml"
+    warn ""
+    warn "warpaccount= skips registration but 'wgcf generate' still calls the same"
+    warn "blocked API, so prefer warpprofile= on a network like this one."
+    return 1
 }
 
 install_beszel() {

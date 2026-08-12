@@ -119,8 +119,30 @@ Russian networks:
   `--mirror <url>` slot for a proxy of your choice.
 - **WARP** registers against `api.cloudflareclient.com` via `wgcf`. A
   `TLS handshake timeout` there is the endpoint being unreachable, not a bug. The
-  script retries once, then records the failure and moves on. Pass `skipwarp=yes`
-  to stop trying, or run `warp` later from a host with a route to it.
+  script retries once, then records the failure and moves on — nothing else is
+  affected. Pass `skipwarp=yes` to stop trying, or reuse credentials from a
+  machine where WARP already works:
+
+  | Argument | What it skips | Needs Cloudflare? |
+  |---|---|---|
+  | `warpprofile=` | registration **and** `wgcf generate` | no — works fully offline |
+  | `warpaccount=` | registration only | yes, `wgcf generate` still calls the API |
+
+  On a blocked network use `warpprofile=`. Each accepts a local path, an http(s)
+  URL, or the file's base64, and is sanity-checked before use:
+
+  ```bash
+  warpprofile=/etc/wireguard/warp.conf
+  warpprofile="$(base64 -w0 warp.conf)"
+  ```
+
+  You can also just drop `wgcf-account.toml` into root's home before running —
+  warp-native does `cd "$HOME"` and skips registration when it finds one.
+
+  The profile path applies the same edits warp-native does after `wgcf generate`
+  (strip `DNS`, add `Table = off` and `PersistentKeepalive = 25`, drop the IPv6
+  `/128`) and then enables `wg-quick@warp`. Note a profile is a single Cloudflare
+  device — reusing one across several live servers may get it dropped.
 
 ## SSH port
 
