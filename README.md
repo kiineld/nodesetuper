@@ -76,7 +76,7 @@ fails.
 9. **Waits for DNS** to propagate, querying `1.1.1.1` directly so a local negative cache doesn't mask success.
 10. **selfsteal** — `install --force --domain <domain> --port 9443`.
 11. **Certificates** — locates the cert Caddy just issued, inside its Docker volume.
-12. **Remnanode** — `GET /api/keygen` → `SECRET_KEY` → `docker-compose.yml` → `up -d`, verified running.
+12. **Remnanode** — `GET /api/keygen` → `SECRET_KEY` → `docker-compose.yml` → `up -d`, verified running. See [Panel versions](#panel-versions).
 13. **Cert renewal watcher** — daily systemd timer, restarts the node when the cert changes.
 14. **Registers the node** — `POST /api/nodes`.
 15. **WARP** — warp-native, driven non-interactively.
@@ -107,6 +107,16 @@ Set a **separate API password** in those settings rather than reusing your accou
 password.
 
 Only an A record is created. IPv6/AAAA is out of scope.
+
+## Panel versions
+
+`GET /api/keygen` returns the node's key under different names depending on panel
+version: `.response.pubKey` on 2.8.x and older, `.response.secretKey` on newer
+builds. The value is byte-identical — a base64 payload of `nodeCertPem`,
+`nodeKeyPem`, `caCertPem` and `jwtPublicKey` — and the node always reads it from
+the `SECRET_KEY` environment variable regardless. The script accepts either field
+and verifies the payload decodes with a `jwtPublicKey` before writing the compose
+file. If neither field is present it reports which keys the panel *did* return.
 
 ## Firewall
 

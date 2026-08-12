@@ -54,6 +54,14 @@ BESZEL_PERMANENT_TOKEN="${BESZEL_PERMANENT_TOKEN:-no}"  # yes = persist the univ
 SKIP_WARP="${SKIP_WARP:-no}"
 SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
 
+# Prompted for if still empty. Declared here so `set -u` never trips on a path
+# that skips the prompt, and so the plain env-var names work as overrides.
+NODE_DOMAIN="${NODE_DOMAIN:-}"
+NODE_NAME="${NODE_NAME:-}"
+REMNA_TOKEN="${REMNA_TOKEN:-}"
+BESZEL_EMAIL="${BESZEL_EMAIL:-}"
+BESZEL_PASSWORD="${BESZEL_PASSWORD:-}"
+
 INSTALL_DIR="/opt/remnanode"
 XRAY_SSL_DIR="/var/lib/remnawave/configs/xray/ssl"
 LOG_FILE="/var/log/remnanode-autoinstall.log"
@@ -189,7 +197,8 @@ Usage: install-node.sh [key=value ...]
              sub=         subdomain label, or @      reguser=  reg.ru login
              regpass=     reg.ru API password
   Beszel     beszelurl=   https://beszel.example.com
-             bemail=      hub email                  bpass=    hub password
+             buser=       hub email (aka bemail=, beszeluser=, blogin=)
+             bpass=       hub password (aka bpassword=, bpwd=)
              bkey=        hub public key             btoken=   universal token
                           (bkey + btoken skip the hub login entirely)
   System     ipv6=        keep|disable               sshport=  default 2224
@@ -237,8 +246,10 @@ parse_args() {
             regrupassword|regrupass|regpass)            set_var REGRU_PASSWORD "$val" ;;
             dnswaitseconds|dnswait)                     set_var DNS_WAIT_SECONDS "$val" ;;
             beszelhuburl|beszelurl|huburl|bhub)         set_var BESZEL_HUB_URL "$val" ;;
-            beszelemail|bemail|beszeluser)              set_var BESZEL_EMAIL "$val" ;;
-            beszelpassword|beszelpass|bpass)            set_var BESZEL_PASSWORD "$val" ;;
+            beszelemail|beszeluser|beszelusername|beszellogin|bemail|buser|busername|blogin)
+                                                        set_var BESZEL_EMAIL "$val" ;;
+            beszelpassword|beszelpass|bpassword|bpass|bpwd)
+                                                        set_var BESZEL_PASSWORD "$val" ;;
             beszelkey|bkey)                             set_var BESZEL_KEY "$val" ;;
             beszeltoken|btoken)                         set_var BESZEL_TOKEN "$val" ;;
             beszelpermanenttoken|btokenpermanent)       set_var BESZEL_PERMANENT_TOKEN "$val" ;;
@@ -867,11 +878,24 @@ locate_certs() {
 install_remnanode() {
     step "Remnawave node container"
     rw_api GET /api/keygen || die "cannot reach /api/keygen"
-    rw_ok || die "cannot fetch SECRET_KEY: $(rw_error)"
+    rw_ok || die "cannot fetch the node key: $(rw_error)"
+
+    # Panel 2.8.x and older return this as .response.pubKey; newer panels renamed
+    # the field to .response.secretKey. The value is byte-identical either way —
+    # a base64 payload of nodeCertPem/nodeKeyPem/caCertPem/jwtPublicKey — and the
+    # node always reads it from the SECRET_KEY environment variable.
     local secret
-    secret=$(printf '%s' "$RW_BODY" | jq -r '.response.secretKey // empty')
-    [[ -n "$secret" ]] || die "panel returned no secretKey"
-    ok "SECRET_KEY retrieved"
+    secret=$(printf '%s' "$RW_BODY" | jq -r '.response.secretKey // .response.pubKey // empty')
+    if [[ -z "$secret" ]]; then
+        die "/api/keygen returned neither secretKey nor pubKey
+     fields present: $(printf '%s' "$RW_BODY" | jq -rc '.response | keys' 2>/dev/null || echo 'unparseable')"
+    fi
+    if printf '%s' "$secret" | base64 -d 2>/dev/null | jq -e '.jwtPublicKey' >/dev/null 2>&1; then
+        ok "node key retrieved and payload verified"
+    else
+        ok "node key retrieved"
+        warn "payload did not decode to the expected shape — the node may reject it"
+    fi
 
     mkdir -p "$INSTALL_DIR" /var/log/remnanode
 
@@ -883,6 +907,10 @@ install_remnanode() {
         echo "    image: remnawave/node:latest"
         echo "    restart: always"
         echo "    network_mode: host"
+        # Present in the upstream docker-compose-prod.yml; xray needs it for
+        # routing/tproxy features.
+        echo "    cap_add:"
+        echo "      - NET_ADMIN"
         echo "    environment:"
         echo "      - NODE_PORT=${NODE_PORT}"
         echo "      - SECRET_KEY=${secret}"
