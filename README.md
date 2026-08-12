@@ -27,6 +27,35 @@ value — you never type an IP.
 Answer `no` to the DNS prompt (or set `MANAGE_DNS=no`) to manage the record
 yourself; the script then asks for the full hostname instead of a label.
 
+## Menu
+
+Run it with **no arguments** and you get a menu instead of a full install:
+
+```
+    1)  Full install               everything below, in order
+    2)  Remnanode container        fetch key, write compose, start it
+    3)  Link TLS certificates      mount selfsteal's cert into Xray + renewal watch
+    4)  Selfsteal site             Caddy masquerade + plaintext fallback listener
+    5)  Fallback listener only     the plaintext :8080 vhost for VLESS/TLS
+    6)  Register node in panel     POST /api/nodes
+    7)  DNS A record (reg.ru)      point a subdomain at this server
+    8)  Firewall (ufw)             80/443/2224/45876, 2222 locked to the panel
+    9)  Kernel tuning              BBR + fq, buffers, ICMP off, IPv6 switch
+   10)  WARP                       warp-native, or reuse a wgcf profile
+   11)  Beszel agent               install and enrol with the hub
+   12)  SSH port -> 2224           verified before port 22 is closed
+    0)  Quit
+```
+
+Each action asks only for what it needs — picking *Firewall* wants the panel URL
+and token (to lock port 2222 to the panel's IP) and nothing about beszel or DNS.
+Answers are remembered for the rest of the session, so chaining several actions
+does not re-ask. After each one you return to the menu, with any problems from
+that action listed.
+
+Passing **any** argument runs the full install instead, unattended as before.
+`all` forces a full run explicitly; `menu` forces the menu even with arguments.
+
 ## Arguments
 
 Any prompt can be pre-answered as a `key=value` argument, in any order. Whatever

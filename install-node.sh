@@ -58,6 +58,7 @@ SKIP_WARP="${SKIP_WARP:-no}"
 WARP_ACCOUNT="${WARP_ACCOUNT:-}"   # wgcf-account.toml  — skips registration
 WARP_PROFILE="${WARP_PROFILE:-}"   # wgcf-profile.conf  — skips registration AND generate
 SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
+RUN_MODE="${RUN_MODE:-}"        # menu | all; empty = menu when there are no arguments
 
 # Prompted for if still empty. Declared here so `set -u` never trips on a path
 # that skips the prompt, and so the plain env-var names work as overrides.
@@ -213,6 +214,9 @@ Usage: install-node.sh [key=value ...]
              warpaccount= reuse a wgcf-account.toml; skips registration, but
                           `wgcf generate` still calls the Cloudflare API
 
+  With no arguments you get an interactive menu of individual steps.
+  Pass `all` to force the full unattended install instead.
+
   Example:
     install-node.sh rpanelurl=https://panel.example.com sub=de1 name=DE-1
 
@@ -227,7 +231,9 @@ parse_args() {
     local arg key val
     for arg in "$@"; do
         case "$arg" in
-            -h|--help|help) usage; exit 0 ;;
+            -h|--help|help)     usage; exit 0 ;;
+            all|full|install)   RUN_MODE=all;  continue ;;
+            menu)               RUN_MODE=menu; continue ;;
         esac
         if [[ "$arg" != *=* ]]; then
             warn "ignoring argument (expected key=value): $arg"
@@ -417,64 +423,23 @@ preflight() {
     ok "preflight done"
 }
 
-gather_input() {
-    step "Configuration"
+# --- Input gathering -------------------------------------------------------
+# Split into small need_* helpers so a single menu action asks only for what it
+# actually uses, instead of interrogating you about beszel to set up a firewall.
+# Each is idempotent: safe to call from several actions in one session.
+
+_HAVE_PANEL=no
+_HAVE_DOMAIN=no
+_HAVE_NAME=no
+_HAVE_BESZEL=no
+_HAVE_IPV6=no
+
+need_panel() {
+    [[ "$_HAVE_PANEL" == "yes" ]] && return 0
     ask PANEL_URL "Remnawave panel URL (https://panel.example.com)"
-    ask BESZEL_HUB_URL "Beszel hub URL (https://beszel.example.com)"
     PANEL_URL="$(strip_slash "$PANEL_URL")"
-    BESZEL_HUB_URL="$(strip_slash "$BESZEL_HUB_URL")"
-
-    # With reg.ru automation you type a label; without it, the whole hostname.
-    ask_yes_no MANAGE_DNS "Create the DNS A record automatically via reg.ru?" "yes"
-    if [[ "$MANAGE_DNS" == "yes" ]]; then
-        ask REGRU_ZONE "reg.ru zone (base domain, e.g. example.com)"
-        ask NODE_SUBDOMAIN "Subdomain label (e.g. de1, or @ for the zone itself)"
-        ask REGRU_USER "reg.ru account login"
-        ask_secret REGRU_PASSWORD "reg.ru API password"
-        NODE_SUBDOMAIN="${NODE_SUBDOMAIN%.}"
-        NODE_SUBDOMAIN="${NODE_SUBDOMAIN%".$REGRU_ZONE"}"   # tolerate a full hostname being pasted
-        if [[ "$NODE_SUBDOMAIN" == "@" || "$NODE_SUBDOMAIN" == "$REGRU_ZONE" ]]; then
-            NODE_SUBDOMAIN="@"
-            NODE_DOMAIN="$REGRU_ZONE"
-        else
-            NODE_DOMAIN="${NODE_SUBDOMAIN}.${REGRU_ZONE}"
-        fi
-        info "node domain: $NODE_DOMAIN"
-    else
-        ask NODE_DOMAIN "Node domain (selfsteal + panel node address)"
-    fi
-
-    ask NODE_NAME "Node name (panel + beszel)"
     ask_secret REMNA_TOKEN "Remnawave API token"
-    if [[ -n "$BESZEL_KEY" && -n "$BESZEL_TOKEN" ]]; then
-        info "beszel key and token supplied — no hub login needed"
-    else
-        ask BESZEL_EMAIL "Beszel hub email (an ordinary user, NOT a superuser)"
-        ask_secret BESZEL_PASSWORD "Beszel hub password"
-    fi
-    ask_yes_no DISABLE_IPV6 "Disable IPv6 on this server?" "no"
 
-    [[ ${#NODE_NAME} -ge 3 && ${#NODE_NAME} -le 30 ]] \
-        || die "node name must be 3-30 characters (panel constraint)"
-    [[ "$MANAGE_DNS" == "yes" && -z "${PUBLIC_IP:-}" ]] \
-        && die "cannot create a DNS record without a detected public IPv4"
-
-    if [[ -z "$PANEL_IP" ]]; then
-        local panel_host="${PANEL_URL#*://}"; panel_host="${panel_host%%/*}"; panel_host="${panel_host%%:*}"
-        PANEL_IP="$(dig +short A "$panel_host" | grep -E '^[0-9.]+$' | head -1 || true)"
-    fi
-    [[ -n "$PANEL_IP" ]] && ok "panel IP: $PANEL_IP" \
-        || warn "could not resolve panel IP — port $NODE_PORT will be opened to all sources"
-
-    if [[ -z "$COUNTRY_CODE" ]]; then
-        COUNTRY_CODE="$(curl -sS --max-time 8 "https://ipapi.co/${PUBLIC_IP:-}/country" 2>/dev/null | tr -dc 'A-Za-z' | head -c 2 || true)"
-    fi
-    [[ ${#COUNTRY_CODE} -eq 2 ]] || COUNTRY_CODE="XX"
-    COUNTRY_CODE="${COUNTRY_CODE^^}"
-    info "country code: $COUNTRY_CODE"
-}
-
-validate_panel() {
     step "Validating Remnawave API token"
     rw_api GET /api/nodes || die "cannot reach $PANEL_URL"
     rw_ok || die "panel rejected the token: $(rw_error)"
@@ -482,13 +447,84 @@ validate_panel() {
     count=$(printf '%s' "$RW_BODY" | jq -r '.response | length' 2>/dev/null || echo 0)
     ok "token valid — panel currently has $count node(s)"
 
-    EXISTING_NODE_UUID="$(printf '%s' "$RW_BODY" \
-        | jq -r --arg n "$NODE_NAME" --arg a "$NODE_DOMAIN" \
-          '.response[] | select(.name == $n or .address == $a) | .uuid' 2>/dev/null | head -1 || true)"
-    if [[ -n "$EXISTING_NODE_UUID" ]]; then
-        warn "a node named '$NODE_NAME' or addressed '$NODE_DOMAIN' already exists ($EXISTING_NODE_UUID)"
-        warn "it will be left untouched; this run will reinstall the node software only"
+    if [[ -z "$PANEL_IP" ]]; then
+        local panel_host="${PANEL_URL#*://}"; panel_host="${panel_host%%/*}"; panel_host="${panel_host%%:*}"
+        PANEL_IP="$(dig +short A "$panel_host" | grep -E '^[0-9.]+$' | head -1 || true)"
     fi
+    [[ -n "$PANEL_IP" ]] && ok "panel IP: $PANEL_IP" \
+        || warn "could not resolve panel IP — port $NODE_PORT will be opened to all sources"
+    _HAVE_PANEL=yes
+}
+
+need_domain() {
+    [[ "$_HAVE_DOMAIN" == "yes" ]] && return 0
+    if [[ -z "$NODE_DOMAIN" ]]; then
+        ask_yes_no MANAGE_DNS "Manage the DNS A record via reg.ru?" "yes"
+        if [[ "$MANAGE_DNS" == "yes" ]]; then
+            ask REGRU_ZONE "reg.ru zone (base domain, e.g. example.com)"
+            ask NODE_SUBDOMAIN "Subdomain label (e.g. de1, or @ for the zone itself)"
+            NODE_SUBDOMAIN="${NODE_SUBDOMAIN%.}"
+            NODE_SUBDOMAIN="${NODE_SUBDOMAIN%".$REGRU_ZONE"}"   # tolerate a pasted hostname
+            if [[ "$NODE_SUBDOMAIN" == "@" || "$NODE_SUBDOMAIN" == "$REGRU_ZONE" ]]; then
+                NODE_SUBDOMAIN="@"; NODE_DOMAIN="$REGRU_ZONE"
+            else
+                NODE_DOMAIN="${NODE_SUBDOMAIN}.${REGRU_ZONE}"
+            fi
+        else
+            ask NODE_DOMAIN "Node domain (full hostname)"
+        fi
+    elif [[ -z "$MANAGE_DNS" ]]; then
+        MANAGE_DNS=no
+    fi
+    ok "node domain: $NODE_DOMAIN"
+    _HAVE_DOMAIN=yes
+}
+
+need_regru() {
+    need_domain
+    [[ "$MANAGE_DNS" == "yes" ]] || return 0
+    ask REGRU_USER "reg.ru account login"
+    ask_secret REGRU_PASSWORD "reg.ru API password"
+    if [[ -z "${PUBLIC_IP:-}" ]]; then
+        die "cannot create a DNS record without a detected public IPv4"
+    fi
+    return 0
+}
+
+need_node_name() {
+    [[ "$_HAVE_NAME" == "yes" ]] && return 0
+    ask NODE_NAME "Node name (panel + beszel)"
+    [[ ${#NODE_NAME} -ge 3 && ${#NODE_NAME} -le 30 ]] \
+        || die "node name must be 3-30 characters (panel constraint)"
+    _HAVE_NAME=yes
+}
+
+need_beszel() {
+    [[ "$_HAVE_BESZEL" == "yes" ]] && return 0
+    ask BESZEL_HUB_URL "Beszel hub URL (https://beszel.example.com)"
+    BESZEL_HUB_URL="$(strip_slash "$BESZEL_HUB_URL")"
+    if [[ -n "$BESZEL_KEY" && -n "$BESZEL_TOKEN" ]]; then
+        info "beszel key and token supplied — no hub login needed"
+    else
+        ask BESZEL_EMAIL "Beszel hub email (an ordinary user, NOT a superuser)"
+        ask_secret BESZEL_PASSWORD "Beszel hub password"
+    fi
+    _HAVE_BESZEL=yes
+}
+
+need_ipv6() {
+    [[ "$_HAVE_IPV6" == "yes" ]] && return 0
+    ask_yes_no DISABLE_IPV6 "Disable IPv6 on this server?" "no"
+    _HAVE_IPV6=yes
+}
+
+need_country() {
+    if [[ -z "$COUNTRY_CODE" ]]; then
+        COUNTRY_CODE="$(curl -sS --max-time 8 "https://ipapi.co/${PUBLIC_IP:-}/country" 2>/dev/null | tr -dc 'A-Za-z' | head -c 2 || true)"
+    fi
+    [[ ${#COUNTRY_CODE} -eq 2 ]] || COUNTRY_CODE="XX"
+    COUNTRY_CODE="${COUNTRY_CODE^^}"
+    info "country code: $COUNTRY_CODE"
 }
 
 resolve_config_profile() {
@@ -1084,8 +1120,16 @@ UNIT
 
 register_node() {
     step "Registering node with the panel"
+    need_country
+
+    if rw_api GET /api/nodes && rw_ok; then
+        EXISTING_NODE_UUID="$(printf '%s' "$RW_BODY" \
+            | jq -r --arg n "$NODE_NAME" --arg a "$NODE_DOMAIN" \
+              '.response[] | select(.name == $n or .address == $a) | .uuid' 2>/dev/null | head -1 || true)"
+    fi
     if [[ -n "${EXISTING_NODE_UUID:-}" ]]; then
-        warn "skipping — node already registered as $EXISTING_NODE_UUID"
+        warn "a node named '$NODE_NAME' or addressed '$NODE_DOMAIN' already exists"
+        warn "skipping registration — $EXISTING_NODE_UUID left untouched"
         return 0
     fi
 
@@ -1445,18 +1489,15 @@ summary() {
 SUMMARY
 }
 
-main() {
-    # Before the log redirect, so --help and bad arguments work without root.
-    parse_args "$@"
-
-    mkdir -p "$(dirname "$LOG_FILE")"
-    exec > >(tee -a "$LOG_FILE") 2>&1
-    printf '%s\n' "=== install-node.sh $(date -Is) ===" >> "$LOG_FILE"
-
-    preflight
-    gather_input
-    validate_panel
+run_all() {
+    need_panel
+    need_domain
+    need_node_name
+    need_beszel
+    need_ipv6
+    [[ "$MANAGE_DNS" == "yes" ]] && need_regru
     resolve_config_profile
+
     beszel_login       || true
     setup_dns          || true
     install_docker
@@ -1473,6 +1514,104 @@ main() {
     install_beszel     || true
     migrate_ssh        || true
     summary
+}
+
+# --- Menu ------------------------------------------------------------------
+
+action_done() {
+    if ((${#FAILED_STEPS[@]})); then
+        printf '
+     %s%d step(s) reported a problem:%s
+' "$C_YEL" "${#FAILED_STEPS[@]}" "$C_RESET"
+        local f
+        for f in "${FAILED_STEPS[@]}"; do printf '       %s✗%s %s
+' "$C_RED" "$C_RESET" "$f"; done
+        FAILED_STEPS=()
+    fi
+    printf '
+'
+    prompt "press Enter to return to the menu: "
+    read -r _ < /dev/tty || true
+}
+
+show_menu() {
+    cat <<MENU
+
+${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLIC_IP)}
+
+    1)  Full install               everything below, in order
+    2)  Remnanode container        fetch key, write compose, start it
+    3)  Link TLS certificates      mount selfsteal's cert into Xray + renewal watch
+    4)  Selfsteal site             Caddy masquerade + plaintext fallback listener
+    5)  Fallback listener only     the plaintext :${FALLBACK_PORT} vhost for VLESS/TLS
+    6)  Register node in panel     POST /api/nodes
+    7)  DNS A record (reg.ru)      point a subdomain at this server
+    8)  Firewall (ufw)             80/443/${SSH_PORT}/${BESZEL_PORT}, ${NODE_PORT} locked to the panel
+    9)  Kernel tuning              BBR + fq, buffers, ICMP off, IPv6 switch
+   10)  WARP                       warp-native, or reuse a wgcf profile
+   11)  Beszel agent               install and enrol with the hub
+   12)  SSH port -> ${SSH_PORT}            verified before port 22 is closed
+
+    0)  Quit
+
+MENU
+}
+
+menu() {
+    local choice
+    while :; do
+        show_menu
+        prompt "choose [0-12]: "
+        read -r choice < /dev/tty || true
+        case "${choice// /}" in
+            1)  run_all; return 0 ;;
+            2)  need_panel; need_domain; install_docker
+                locate_certs || true; install_remnanode; action_done ;;
+            3)  need_panel; need_domain; locate_certs || true
+                if [[ -z "$CERT_PATH" ]]; then
+                    warn "no certificate found for $NODE_DOMAIN — run selfsteal (4) first"
+                else
+                    install_remnanode; install_cert_watcher || true
+                fi
+                action_done ;;
+            4)  need_domain; install_docker; install_selfsteal || true
+                configure_fallback_site || true; action_done ;;
+            5)  configure_fallback_site || true; action_done ;;
+            6)  need_panel; need_domain; need_node_name
+                resolve_config_profile; register_node; action_done ;;
+            7)  MANAGE_DNS=yes; need_regru; setup_dns || true; await_dns || true; action_done ;;
+            8)  need_panel; configure_ufw || true; action_done ;;
+            9)  need_ipv6; tune_kernel || true; action_done ;;
+           10)  install_warp || true; action_done ;;
+           11)  need_domain; need_beszel; beszel_login || true
+                install_beszel || true; action_done ;;
+           12)  migrate_ssh || true; action_done ;;
+            0|q|quit|exit) printf '
+'; return 0 ;;
+            "") ;;
+            *)  warn "no such option: $choice" ;;
+        esac
+    done
+}
+
+main() {
+    # Before the log redirect, so --help and bad arguments work without root.
+    parse_args "$@"
+
+    mkdir -p "$(dirname "$LOG_FILE")"
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    printf '%s
+' "=== install-node.sh $(date -Is) ===" >> "$LOG_FILE"
+
+    preflight
+
+    # No arguments and a terminal to talk to: show the menu. Any argument means
+    # you already know what you want, so run the lot.
+    if [[ "$RUN_MODE" == "menu" ]] || { [[ -z "$RUN_MODE" ]] && (( $# == 0 )) && [[ -r /dev/tty ]]; }; then
+        menu
+    else
+        run_all
+    fi
 }
 
 main "$@"
