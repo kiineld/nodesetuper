@@ -24,6 +24,13 @@ set -Eeuo pipefail
 PANEL_URL="${PANEL_URL:-}"              # e.g. https://panel.example.com  (no trailing slash)
 BESZEL_HUB_URL="${BESZEL_HUB_URL:-}"    # e.g. https://beszel.example.com (no trailing slash)
 
+# reg.ru DNS. Set the zone and login here; then each run only asks for a subdomain.
+# The domain must use ns1.reg.ru / ns2.reg.ru, and API access must be enabled at
+# https://www.reg.ru/user/account/#/settings/api/ with this server's IP allowed.
+REGRU_ZONE="${REGRU_ZONE:-}"            # base domain, e.g. example.com
+REGRU_USER="${REGRU_USER:-}"            # reg.ru account login
+REGRU_PASSWORD="${REGRU_PASSWORD:-}"    # reg.ru API password (set a separate one, not your account password)
+
 # Ports. These match the ufw rules opened below.
 NODE_PORT="${NODE_PORT:-2222}"          # panel -> node internal API
 SSH_PORT="${SSH_PORT:-2224}"            # new SSH port
@@ -36,6 +43,9 @@ PANEL_IP="${PANEL_IP:-}"                       # override the auto-resolved pane
 CONFIG_PROFILE_UUID="${CONFIG_PROFILE_UUID:-}" # skip the config-profile picker
 COUNTRY_CODE="${COUNTRY_CODE:-}"               # auto-detected if empty
 DISABLE_IPV6="${DISABLE_IPV6:-}"               # yes | no  (prompted if empty)
+MANAGE_DNS="${MANAGE_DNS:-}"                   # yes | no  (prompted if empty)
+NODE_SUBDOMAIN="${NODE_SUBDOMAIN:-}"           # label only, e.g. "de1", or "@" for the zone apex
+DNS_WAIT_SECONDS="${DNS_WAIT_SECONDS:-300}"    # how long to wait for the record to propagate
 BESZEL_PERMANENT_TOKEN="${BESZEL_PERMANENT_TOKEN:-no}"  # yes = persist the universal token on the hub
 SKIP_WARP="${SKIP_WARP:-no}"
 SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
@@ -180,6 +190,45 @@ bz_get() {  # bz_get <path>
 }
 
 # ---------------------------------------------------------------------------
+# reg.ru REG.API 2 — https://www.reg.ru/reseller/api2doc
+#
+# Everything is POSTed as input_format=json + input_data={...}, with the
+# credentials inside the JSON body. Two layers of result reporting: a top-level
+# .result for the call, and a per-domain .answer.domains[].result for the zone.
+# ---------------------------------------------------------------------------
+
+REGRU_BODY=""
+
+regru_api() {  # regru_api <category/function> [extra JSON object]
+    local path=$1 extra=${2:-'{}'} payload
+    payload=$(jq -nc \
+        --arg u "$REGRU_USER" --arg p "$REGRU_PASSWORD" --arg d "$REGRU_ZONE" \
+        --argjson extra "$extra" \
+        '{username:$u, password:$p, domains:[{dname:$d}], output_content_type:"plain"} + $extra')
+    REGRU_BODY=$(curl -sS --max-time 45 \
+        --data-urlencode "input_format=json" \
+        --data-urlencode "input_data=${payload}" \
+        "https://api.reg.ru/api/regru2/${path}") || return 1
+}
+
+regru_ok() { [[ "$(printf '%s' "$REGRU_BODY" | jq -r '.result // "error"' 2>/dev/null)" == "success" ]]; }
+
+regru_err() {
+    printf '%s' "$REGRU_BODY" \
+        | jq -r '"\(.error_code // "UNKNOWN") — \(.error_text // "no detail")"' 2>/dev/null \
+        || printf '%s' "$REGRU_BODY" | head -c 200
+}
+
+regru_zone_ok() {
+    [[ "$(printf '%s' "$REGRU_BODY" | jq -r '.answer.domains[0].result // "error"' 2>/dev/null)" == "success" ]]
+}
+
+regru_zone_err() {
+    printf '%s' "$REGRU_BODY" \
+        | jq -r '.answer.domains[0] | "\(.error_code // .result // "unknown") — \(.error_text // "")"' 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
 
@@ -222,7 +271,26 @@ gather_input() {
     PANEL_URL="$(strip_slash "$PANEL_URL")"
     BESZEL_HUB_URL="$(strip_slash "$BESZEL_HUB_URL")"
 
-    ask NODE_DOMAIN "Node domain (selfsteal + panel node address)"
+    # With reg.ru automation you type a label; without it, the whole hostname.
+    ask_yes_no MANAGE_DNS "Create the DNS A record automatically via reg.ru?" "yes"
+    if [[ "$MANAGE_DNS" == "yes" ]]; then
+        ask REGRU_ZONE "reg.ru zone (base domain, e.g. example.com)"
+        ask NODE_SUBDOMAIN "Subdomain label (e.g. de1, or @ for the zone itself)"
+        ask REGRU_USER "reg.ru account login"
+        ask_secret REGRU_PASSWORD "reg.ru API password"
+        NODE_SUBDOMAIN="${NODE_SUBDOMAIN%.}"
+        NODE_SUBDOMAIN="${NODE_SUBDOMAIN%".$REGRU_ZONE"}"   # tolerate a full hostname being pasted
+        if [[ "$NODE_SUBDOMAIN" == "@" || "$NODE_SUBDOMAIN" == "$REGRU_ZONE" ]]; then
+            NODE_SUBDOMAIN="@"
+            NODE_DOMAIN="$REGRU_ZONE"
+        else
+            NODE_DOMAIN="${NODE_SUBDOMAIN}.${REGRU_ZONE}"
+        fi
+        info "node domain: $NODE_DOMAIN"
+    else
+        ask NODE_DOMAIN "Node domain (selfsteal + panel node address)"
+    fi
+
     ask NODE_NAME "Node name (panel + beszel)"
     ask_secret REMNA_TOKEN "Remnawave API token"
     ask BESZEL_EMAIL "Beszel hub email (a regular user, NOT a superuser)"
@@ -231,17 +299,8 @@ gather_input() {
 
     [[ ${#NODE_NAME} -ge 3 && ${#NODE_NAME} -le 30 ]] \
         || die "node name must be 3-30 characters (panel constraint)"
-
-    local resolved
-    resolved="$(dig +short A "$NODE_DOMAIN" | grep -E '^[0-9.]+$' | head -1 || true)"
-    if [[ -z "$resolved" ]]; then
-        warn "$NODE_DOMAIN does not resolve to an A record yet — ACME will fail"
-    elif [[ -n "${PUBLIC_IP:-}" && "$resolved" != "$PUBLIC_IP" ]]; then
-        warn "$NODE_DOMAIN resolves to $resolved but this host is $PUBLIC_IP"
-        warn "if that is a Cloudflare proxy IP, switch the record to DNS-only or the panel cannot reach port $NODE_PORT"
-    else
-        ok "$NODE_DOMAIN -> $resolved"
-    fi
+    [[ "$MANAGE_DNS" == "yes" && -z "${PUBLIC_IP:-}" ]] \
+        && die "cannot create a DNS record without a detected public IPv4"
 
     if [[ -z "$PANEL_IP" ]]; then
         local panel_host="${PANEL_URL#*://}"; panel_host="${panel_host%%/*}"; panel_host="${panel_host%%:*}"
@@ -345,6 +404,90 @@ beszel_login() {
         fi
     fi
     ok "universal token ready"
+}
+
+setup_dns() {
+    if [[ "$MANAGE_DNS" != "yes" ]]; then
+        step "DNS"; info "skipped — managing the record yourself"; return 0
+    fi
+    step "DNS record via reg.ru"
+
+    regru_api nop || die "cannot reach api.reg.ru"
+    if ! regru_ok; then
+        local code
+        code=$(printf '%s' "$REGRU_BODY" | jq -r '.error_code // "UNKNOWN"')
+        # reg.ru checks the IP allowlist before it checks the password, so this
+        # is the first thing a brand-new server hits.
+        if [[ "$code" == "ACCESS_DENIED_FROM_IP" ]]; then
+            die "reg.ru refused this server's IP.
+
+     This host is ${PUBLIC_IP}, and that address is not on your REG.API allowlist.
+     Add it (or allow all addresses) at
+       https://www.reg.ru/user/account/#/settings/api/
+     then re-run. Nothing has been changed on this server yet.
+
+     Deploying many short-lived nodes? Either allow all addresses, or run with
+     MANAGE_DNS=no and point the record at ${PUBLIC_IP} yourself."
+        fi
+        die "reg.ru rejected the request: $(regru_err)"
+    fi
+    ok "authenticated as $REGRU_USER"
+
+    # Zone management only works when the domain actually uses reg.ru nameservers.
+    regru_api zone/nop || die "zone/nop request failed"
+    regru_zone_ok || die "cannot manage the DNS zone for $REGRU_ZONE: $(regru_zone_err)
+     The domain must use ns1.reg.ru and ns2.reg.ru."
+    ok "zone $REGRU_ZONE is manageable"
+
+    regru_api zone/get_resource_records || die "cannot read the zone records"
+    regru_zone_ok || die "cannot read the zone records: $(regru_zone_err)"
+
+    local existing
+    existing=$(printf '%s' "$REGRU_BODY" | jq -r --arg s "$NODE_SUBDOMAIN" \
+        '[.answer.domains[0].rrs[]? | select(.rectype == "A" and .subname == $s) | .content] | join(" ")')
+
+    if [[ "$existing" == "$PUBLIC_IP" ]]; then
+        ok "$NODE_DOMAIN already points at $PUBLIC_IP — nothing to do"
+        return 0
+    fi
+
+    if [[ -n "$existing" ]]; then
+        warn "$NODE_DOMAIN currently points at: $existing"
+        local old
+        for old in $existing; do
+            regru_api zone/remove_record "$(jq -nc --arg s "$NODE_SUBDOMAIN" --arg c "$old" \
+                '{subdomain:$s, record_type:"A", content:$c}')" || die "remove_record request failed"
+            regru_zone_ok || die "could not remove the stale A record $old: $(regru_zone_err)"
+            info "removed stale A record $old"
+        done
+    fi
+
+    regru_api zone/add_alias "$(jq -nc --arg s "$NODE_SUBDOMAIN" --arg ip "$PUBLIC_IP" \
+        '{subdomain:$s, ipaddr:$ip}')" || die "add_alias request failed"
+    regru_zone_ok || die "could not create the A record: $(regru_zone_err)"
+    ok "A record $NODE_DOMAIN -> $PUBLIC_IP created"
+}
+
+await_dns() {
+    step "Waiting for DNS"
+    local waited=0 resolved=""
+    while (( waited < DNS_WAIT_SECONDS )); do
+        # Ask a public resolver directly; the local one may still hold a negative cache entry.
+        resolved="$(dig +short A "$NODE_DOMAIN" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)"
+        [[ -n "$resolved" && ( -z "$PUBLIC_IP" || "$resolved" == "$PUBLIC_IP" ) ]] && break
+        sleep 10; waited=$((waited + 10))
+        (( waited % 60 == 0 )) && info "still waiting... ${waited}s (currently: ${resolved:-NXDOMAIN})"
+    done
+
+    if [[ -z "$resolved" ]]; then
+        warn "$NODE_DOMAIN still does not resolve after ${waited}s — ACME will fail"
+        warn "selfsteal will fall back to a self-signed certificate"
+    elif [[ -n "$PUBLIC_IP" && "$resolved" != "$PUBLIC_IP" ]]; then
+        warn "$NODE_DOMAIN resolves to $resolved but this host is $PUBLIC_IP"
+        warn "if that is a Cloudflare proxy IP, switch the record to DNS-only or the panel cannot reach port $NODE_PORT"
+    else
+        ok "$NODE_DOMAIN -> $resolved"
+    fi
 }
 
 install_docker() {
@@ -784,6 +927,7 @@ summary() {
      ${C_GRN}Node provisioned.${C_RESET}
 
        Panel node    ${NODE_NAME}  ->  ${NODE_DOMAIN}:${NODE_PORT}${REGISTERED_UUID:+  (${REGISTERED_UUID})}
+       DNS           $([[ "$MANAGE_DNS" == "yes" ]] && echo "A ${NODE_DOMAIN} -> ${PUBLIC_IP} (reg.ru)" || echo "managed manually")
        Selfsteal     https://${NODE_DOMAIN}  (Caddy on :${SELFSTEAL_PORT})
        TLS cert      ${CERT_PATH:-none mounted}
        SSH           $([[ "${SSH_MIGRATED:-no}" == "yes" ]] && echo "port ${SSH_PORT}" || echo "port 22 (unchanged)")
@@ -792,9 +936,11 @@ summary() {
        Congestion    $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) / $(sysctl -n net.core.default_qdisc 2>/dev/null)
        Log           ${LOG_FILE}
 
-     ${C_YEL}Two things this script cannot do for you:${C_RESET}
-       1. The A record for ${NODE_DOMAIN} must be DNS-only (grey cloud). If it is
-          proxied through Cloudflare the panel cannot reach port ${NODE_PORT}.
+     ${C_YEL}What this script cannot do for you:${C_RESET}
+       1. $([[ "$MANAGE_DNS" == "yes" ]] \
+            && echo "Nothing on the DNS side — the A record was created for you." \
+            || echo "The A record for ${NODE_DOMAIN} must be DNS-only (grey cloud); a
+          proxied Cloudflare record stops the panel reaching port ${NODE_PORT}.")
        2. In the panel, your Reality inbound's serverNames must include
           ${NODE_DOMAIN} and its dest must point at 127.0.0.1:${SELFSTEAL_PORT},
           otherwise the selfsteal site is never actually used.
@@ -818,9 +964,11 @@ main() {
     validate_panel
     resolve_config_profile
     beszel_login
+    setup_dns
     install_docker
     tune_kernel
     configure_ufw
+    await_dns
     install_selfsteal
     locate_certs
     install_remnanode

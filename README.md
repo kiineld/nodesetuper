@@ -9,22 +9,30 @@ bash <(curl -Ls https://raw.githubusercontent.com/kiineld/nodesetuper/main/insta
 
 ## What you type
 
-Edit `PANEL_URL` and `BESZEL_HUB_URL` at the top of the script once, push it, and
-every run after that asks only for:
+Edit `PANEL_URL`, `BESZEL_HUB_URL`, `REGRU_ZONE` and `REGRU_USER` at the top of the
+script once, push it, and every run after that asks only for:
 
 | Prompt | Used for |
 |---|---|
-| Node domain | selfsteal site, the node's `address` in the panel, ACME cert |
+| Subdomain label | e.g. `de1` — combined with `REGRU_ZONE` into the full hostname |
 | Node name | panel node name (3–30 chars) |
 | Remnawave API token | panel API auth |
 | Beszel hub email + password | fetching the hub key and universal token |
+| reg.ru API password | creating the A record |
 | Disable IPv6? | y/N switch |
+
+The server's public IPv4 is detected automatically and becomes the A record's
+value — you never type an IP.
+
+Answer `no` to the DNS prompt (or set `MANAGE_DNS=no`) to manage the record
+yourself; the script then asks for the full hostname instead of a label.
 
 Every prompt has an environment-variable equivalent, so it also runs unattended:
 
 ```bash
-NODE_DOMAIN=de1.example.com NODE_NAME=DE-1 REMNA_TOKEN=xxx \
-BESZEL_EMAIL=me@example.com BESZEL_PASSWORD=yyy DISABLE_IPV6=yes \
+NODE_SUBDOMAIN=de1 NODE_NAME=DE-1 REMNA_TOKEN=xxx \
+BESZEL_EMAIL=me@example.com BESZEL_PASSWORD=yyy \
+REGRU_PASSWORD=zzz DISABLE_IPV6=yes \
 bash install-node.sh
 ```
 
@@ -37,17 +45,44 @@ to issue universal tokens to superusers.
 2. **Validates the panel token** before touching anything, and detects a node that is already registered under the same name or address.
 3. **Resolves the config profile** — auto if there is exactly one, numbered picker otherwise, or set `CONFIG_PROFILE_UUID`.
 4. **Beszel login** → `GET /api/beszel/getkey` for the hub public key, `GET /api/beszel/universal-token` for the token (reuses an active one, otherwise mints a 1-hour ephemeral one; `BESZEL_PERMANENT_TOKEN=yes` makes it permanent).
-5. **Docker** via `get.docker.com`, skipped if present.
-6. **Kernel tuning** — see below.
-7. **ufw** — rules added *before* `enable`, port 22 kept open until the new SSH port is verified.
-8. **selfsteal** — `install --force --domain <domain> --port 9443`.
-9. **Certificates** — locates the cert Caddy just issued, inside its Docker volume.
-10. **Remnanode** — `GET /api/keygen` → `SECRET_KEY` → `docker-compose.yml` → `up -d`, verified running.
-11. **Cert renewal watcher** — daily systemd timer, restarts the node when the cert changes.
-12. **Registers the node** — `POST /api/nodes`.
-13. **WARP** — warp-native, driven non-interactively.
-14. **Beszel agent** — auto-registers itself with the hub.
-15. **SSH → 2224** — verified, then port 22 is closed.
+5. **DNS** — creates the A record at reg.ru (see below).
+6. **Docker** via `get.docker.com`, skipped if present.
+7. **Kernel tuning** — see below.
+8. **ufw** — rules added *before* `enable`, port 22 kept open until the new SSH port is verified.
+9. **Waits for DNS** to propagate, querying `1.1.1.1` directly so a local negative cache doesn't mask success.
+10. **selfsteal** — `install --force --domain <domain> --port 9443`.
+11. **Certificates** — locates the cert Caddy just issued, inside its Docker volume.
+12. **Remnanode** — `GET /api/keygen` → `SECRET_KEY` → `docker-compose.yml` → `up -d`, verified running.
+13. **Cert renewal watcher** — daily systemd timer, restarts the node when the cert changes.
+14. **Registers the node** — `POST /api/nodes`.
+15. **WARP** — warp-native, driven non-interactively.
+16. **Beszel agent** — auto-registers itself with the hub.
+17. **SSH → 2224** — verified, then port 22 is closed.
+
+## DNS (reg.ru)
+
+Uses [REG.API 2](https://www.reg.ru/reseller/api2doc): `zone/nop` to confirm the zone
+is manageable, `zone/get_resource_records` to see what's there, `zone/remove_record`
+to clear a stale A record, then `zone/add_alias` to point the label at the detected
+public IPv4. Re-running with an already-correct record is a no-op.
+
+**Two prerequisites**, both one-time:
+
+1. The domain must use `ns1.reg.ru` / `ns2.reg.ru`. Zone management does nothing otherwise, and the script stops with that message rather than pretending it worked.
+2. REG.API must be enabled at [account settings → API](https://www.reg.ru/user/account/#/settings/api/), **with the calling server's IP allowed**.
+
+Point 2 is the awkward one for this use case. reg.ru checks the IP allowlist
+*before* it checks the password, so a brand-new node fails immediately with
+`ACCESS_DENIED_FROM_IP` — and the caller here is the new node itself, whose IP
+changes every time you provision one. Either allow all addresses in the API
+settings, or add each server's IP before running. The script detects this specific
+error and tells you the exact IP to whitelist, and it happens before anything on
+the server has been modified, so you can whitelist and re-run cleanly.
+
+Set a **separate API password** in those settings rather than reusing your account
+password.
+
+Only an A record is created. IPv6/AAAA is out of scope.
 
 ## Firewall
 
@@ -122,13 +157,18 @@ Reference the certs in your Xray config as:
 
 ## Not automated
 
-- The DNS A record must be **DNS-only**, not Cloudflare-proxied, or the panel cannot reach port 2222.
-- Your Reality inbound in the panel must list the node domain in `serverNames` and point `dest` at `127.0.0.1:9443`. The script prints both reminders at the end.
+- Your Reality inbound in the panel must list the node domain in `serverNames` and point `dest` at `127.0.0.1:9443`. The script prints this reminder at the end.
+- With `MANAGE_DNS=no`, the record you create must be **DNS-only**, not Cloudflare-proxied, or the panel cannot reach port 2222.
 
 ## Options
 
 | Variable | Default | Effect |
 |---|---|---|
+| `MANAGE_DNS` | prompt | `no` skips reg.ru and asks for a full hostname |
+| `REGRU_ZONE` / `REGRU_USER` / `REGRU_PASSWORD` | – | reg.ru zone and credentials |
+| `NODE_SUBDOMAIN` | prompt | label only, or `@` for the zone apex |
+| `NODE_DOMAIN` | derived | full hostname; required when `MANAGE_DNS=no` |
+| `DNS_WAIT_SECONDS` | `300` | how long to wait for propagation |
 | `PANEL_IP` | resolved from `PANEL_URL` | source IP allowed on port 2222 |
 | `PANEL_EXTRA_HEADER` | – | extra header if the panel sits behind header auth, e.g. `"X-Api-Key: secret"` |
 | `CONFIG_PROFILE_UUID` | – | skip the profile picker |
