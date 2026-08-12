@@ -49,6 +49,10 @@ Run it with **no arguments** and you get a menu instead of a full install:
 
 Each action asks only for what it needs — picking *Firewall* wants the panel URL
 and token (to lock port 2222 to the panel's IP) and nothing about beszel or DNS.
+On a node that has been set up before, *Remnanode container* and *Link TLS
+certificates* need no panel access at all: the `SECRET_KEY` is read back out of
+the existing `docker-compose.yml`, and the domain is recovered from the cert
+mount already in it (or from selfsteal's `.env`) and offered as the default.
 Answers are remembered for the rest of the session, so chaining several actions
 does not re-ask. After each one you return to the menu, with any problems from
 that action listed.

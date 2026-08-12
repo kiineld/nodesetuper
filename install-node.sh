@@ -434,6 +434,34 @@ _HAVE_NAME=no
 _HAVE_BESZEL=no
 _HAVE_IPV6=no
 
+# Pull the SECRET_KEY back out of a compose file written by an earlier run.
+node_secret_from_compose() {
+    local f="$INSTALL_DIR/docker-compose.yml" v
+    [[ -f "$f" ]] || return 1
+    v=$(sed -n 's/^[[:space:]]*-[[:space:]]*SECRET_KEY=//p' "$f" | head -1)
+    v="${v%\"}"; v="${v#\"}"
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
+}
+
+# Recover the node's domain from what is already installed, so a re-run does not
+# have to ask. Tries the cert mount in the compose file, then selfsteal's env.
+detect_node_domain() {
+    local d="" f
+    if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+        d=$(sed -n 's#.*/certificates/[^/]*/\([^/]*\)/\1\.crt.*#\1#p' \
+            "$INSTALL_DIR/docker-compose.yml" | head -1)
+    fi
+    if [[ -z "$d" ]]; then
+        for f in /opt/caddy/.env /opt/nginx-selfsteal/.env; do
+            [[ -f "$f" ]] || continue
+            d=$(sed -n 's/^SELF_STEAL_DOMAIN=//p' "$f" | tr -d '"' | head -1)
+            [[ -n "$d" ]] && break
+        done
+    fi
+    printf '%s' "$d"
+}
+
 need_panel() {
     [[ "$_HAVE_PANEL" == "yes" ]] && return 0
     ask PANEL_URL "Remnawave panel URL (https://panel.example.com)"
@@ -459,6 +487,15 @@ need_panel() {
 need_domain() {
     [[ "$_HAVE_DOMAIN" == "yes" ]] && return 0
     if [[ -z "$NODE_DOMAIN" ]]; then
+        local detected=""
+        [[ "$MANAGE_DNS" != "yes" ]] && detected="$(detect_node_domain)"
+        if [[ -n "$detected" ]]; then
+            MANAGE_DNS="${MANAGE_DNS:-no}"
+            ask NODE_DOMAIN "Node domain" "$detected"
+            ok "node domain: $NODE_DOMAIN"
+            _HAVE_DOMAIN=yes
+            return 0
+        fi
         ask_yes_no MANAGE_DNS "Manage the DNS A record via reg.ru?" "yes"
         if [[ "$MANAGE_DNS" == "yes" ]]; then
             ask REGRU_ZONE "reg.ru zone (base domain, e.g. example.com)"
@@ -990,24 +1027,35 @@ locate_certs() {
 
 install_remnanode() {
     step "Remnawave node container"
-    rw_api GET /api/keygen || die "cannot reach /api/keygen"
-    rw_ok || die "cannot fetch the node key: $(rw_error)"
+    local secret=""
 
-    # Panel 2.8.x and older return this as .response.pubKey; newer panels renamed
-    # the field to .response.secretKey. The value is byte-identical either way —
-    # a base64 payload of nodeCertPem/nodeKeyPem/caCertPem/jwtPublicKey — and the
-    # node always reads it from the SECRET_KEY environment variable.
-    local secret
-    secret=$(printf '%s' "$RW_BODY" | jq -r '.response.secretKey // .response.pubKey // empty')
-    if [[ -z "$secret" ]]; then
-        die "/api/keygen returned neither secretKey nor pubKey
-     fields present: $(printf '%s' "$RW_BODY" | jq -rc '.response | keys' 2>/dev/null || echo 'unparseable')"
-    fi
-    if printf '%s' "$secret" | base64 -d 2>/dev/null | jq -e '.jwtPublicKey' >/dev/null 2>&1; then
-        ok "node key retrieved and payload verified"
+    # Only the panel can mint this key, but it is already sitting in the compose
+    # file on a node that has been set up before. Reuse it, so actions that just
+    # rewrite the compose (linking certificates, say) need no panel access at
+    # all. If the panel has already been validated this run, take a fresh key —
+    # that is the case where you might be pointing the node at a new panel.
+    if [[ "$_HAVE_PANEL" != "yes" ]] && secret=$(node_secret_from_compose); then
+        ok "reusing the SECRET_KEY already in $INSTALL_DIR/docker-compose.yml"
     else
-        ok "node key retrieved"
-        warn "payload did not decode to the expected shape — the node may reject it"
+        need_panel
+        rw_api GET /api/keygen || die "cannot reach /api/keygen"
+        rw_ok || die "cannot fetch the node key: $(rw_error)"
+
+        # Panel 2.8.x and older return this as .response.pubKey; newer panels
+        # renamed the field to .response.secretKey. The value is byte-identical
+        # either way — a base64 payload of nodeCertPem/nodeKeyPem/caCertPem/
+        # jwtPublicKey — and the node always reads it from SECRET_KEY.
+        secret=$(printf '%s' "$RW_BODY" | jq -r '.response.secretKey // .response.pubKey // empty')
+        if [[ -z "$secret" ]]; then
+            die "/api/keygen returned neither secretKey nor pubKey
+     fields present: $(printf '%s' "$RW_BODY" | jq -rc '.response | keys' 2>/dev/null || echo 'unparseable')"
+        fi
+        if printf '%s' "$secret" | base64 -d 2>/dev/null | jq -e '.jwtPublicKey' >/dev/null 2>&1; then
+            ok "node key retrieved and payload verified"
+        else
+            ok "node key retrieved"
+            warn "payload did not decode to the expected shape — the node may reject it"
+        fi
     fi
 
     mkdir -p "$INSTALL_DIR" /var/log/remnanode
@@ -1565,9 +1613,9 @@ menu() {
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
-            2)  need_panel; need_domain; install_docker
+            2)  need_domain; install_docker
                 locate_certs || true; install_remnanode; action_done ;;
-            3)  need_panel; need_domain; locate_certs || true
+            3)  need_domain; locate_certs || true
                 if [[ -z "$CERT_PATH" ]]; then
                     warn "no certificate found for $NODE_DOMAIN — run selfsteal (4) first"
                 else
