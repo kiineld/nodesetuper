@@ -108,6 +108,36 @@ password.
 
 Only an A record is created. IPv6/AAAA is out of scope.
 
+## Restricted networks
+
+Two steps reach out to hosts that are commonly blocked or throttled, notably from
+Russian networks:
+
+- **Beszel agent** downloads its binary from GitHub releases. On failure the script
+  automatically retries through the installer's own proxy (`--mirror`, default
+  `https://gh.beszel.dev`). If both fail it prints the manual command with a
+  `--mirror <url>` slot for a proxy of your choice.
+- **WARP** registers against `api.cloudflareclient.com` via `wgcf`. A
+  `TLS handshake timeout` there is the endpoint being unreachable, not a bug. The
+  script retries once, then records the failure and moves on. Pass `skipwarp=yes`
+  to stop trying, or run `warp` later from a host with a route to it.
+
+## SSH port
+
+`sshd_config` precedence is the reverse of most config systems — from
+`sshd_config(5)`: *"for each keyword, the first obtained value will be used"*. On
+Ubuntu the `Include /etc/ssh/sshd_config.d/*.conf` sits at the **top** of
+`sshd_config`, so drop-ins are read first, in glob order. A drop-in named `99-`
+therefore *loses* to `50-cloud-init.conf`, and on images with no `Include` line at
+all a drop-in is inert.
+
+So the script writes `00-remnanode-port.conf`, comments out every competing `Port`
+directive in `sshd_config` and the other drop-ins, and falls back to prepending
+`Port` into `sshd_config` itself when there is no `Include`. It then asks
+`sshd -T` what port will actually be bound **before** restarting anything, and
+only closes port 22 once `ss` confirms the new port is listening. Every failure
+path restores the original `sshd_config` from a backup and leaves 22 open.
+
 ## Panel versions
 
 `GET /api/keygen` returns the node's key under different names depending on panel

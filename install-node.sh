@@ -1044,13 +1044,32 @@ install_warp() {
     fi
     # The installer asks three questions: language, WARP+ licence, watchdog
     # interval. Empty answers take the defaults (English / free / 10 min).
-    curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o /tmp/warp-install.sh
-    printf '1\n\n\n' | bash /tmp/warp-install.sh || warn "warp installer returned non-zero — check manually with: warp"
+    if ! curl -fsSL https://raw.githubusercontent.com/distillium/warp-native/main/install.sh -o /tmp/warp-install.sh; then
+        soft_fail "could not download the warp installer"
+        return 1
+    fi
+
+    # Registration talks to api.cloudflareclient.com, which times out often
+    # enough to be worth a second attempt.
+    local attempt
+    for attempt in 1 2; do
+        if printf '1\n\n\n' | bash /tmp/warp-install.sh; then break; fi
+        if (( attempt == 1 )); then
+            warn "warp registration failed — retrying once in 15s"
+            sleep 15
+        fi
+    done
     rm -f /tmp/warp-install.sh
+
     if systemctl is-active --quiet wg-quick@warp 2>/dev/null; then
         ok "warp tunnel up"
     else
-        warn "warp tunnel is not active — run 'warp' to inspect"
+        soft_fail "warp tunnel is not active"
+        warn "wgcf registers against api.cloudflareclient.com, which is commonly"
+        warn "blocked or throttled from RU networks — that is the usual cause of"
+        warn "the TLS handshake timeout. Options: re-run 'warp' later from a host"
+        warn "with a route to it, or pass skipwarp=yes to stop trying."
+        return 1
     fi
 }
 
@@ -1071,10 +1090,18 @@ install_beszel() {
     local args=(-k "$BESZEL_KEY" -p "$BESZEL_PORT" -url "$BESZEL_HUB_URL")
     [[ -n "$BESZEL_TOKEN" ]] && args+=(-t "$BESZEL_TOKEN")
 
+    # The agent binary comes from GitHub releases, which is unreachable from
+    # some networks. The installer ships a proxy fallback for exactly this.
     if ! /tmp/install-beszel.sh "${args[@]}"; then
-        rm -f /tmp/install-beszel.sh
-        soft_fail "beszel agent install failed"
-        return 1
+        warn "direct GitHub download failed — retrying via the mirror"
+        if ! /tmp/install-beszel.sh "${args[@]}" --mirror; then
+            rm -f /tmp/install-beszel.sh
+            soft_fail "beszel agent install failed (direct and mirror)"
+            warn "retry by hand with a proxy of your choice:"
+            warn "  curl -sL https://get.beszel.dev -o /tmp/b.sh && sh /tmp/b.sh --mirror <url> \\"
+            warn "    -k '<key>' -p ${BESZEL_PORT} -url ${BESZEL_HUB_URL}"
+            return 1
+        fi
     fi
     rm -f /tmp/install-beszel.sh
     sleep 3
@@ -1090,6 +1117,28 @@ install_beszel() {
         soft_fail "beszel-agent is not active — check: journalctl -u beszel-agent -n 50"
         return 1
     fi
+}
+
+SSHD_BACKUP=/etc/ssh/sshd_config.remnanode.bak
+
+# Prepend Port to sshd_config itself, for images whose sshd_config has no
+# Include line. Written via a temp file and copied back, so the original
+# inode, owner and mode survive.
+sshd_prepend_port() {
+    grep -qE "^Port[[:space:]]+${SSH_PORT}\\b" /etc/ssh/sshd_config 2>/dev/null && return 0
+    local tmp; tmp=$(mktemp)
+    { printf '# Managed by install-node.sh\n'
+      printf 'Port %s\n\n' "$SSH_PORT"
+      cat /etc/ssh/sshd_config
+    } > "$tmp"
+    cat "$tmp" > /etc/ssh/sshd_config
+    rm -f "$tmp"
+}
+
+ssh_rollback() {
+    rm -f /etc/ssh/sshd_config.d/00-remnanode-port.conf
+    [[ -f "$SSHD_BACKUP" ]] && cp -a "$SSHD_BACKUP" /etc/ssh/sshd_config
+    return 0
 }
 
 migrate_ssh() {
@@ -1112,24 +1161,61 @@ migrate_ssh() {
     systemctl enable --now ssh.service >/dev/null 2>&1 \
         || systemctl enable --now sshd.service >/dev/null 2>&1 || true
 
-    # A drop-in beats sed'ing sshd_config: distro cloud-init drop-ins are read
-    # after the main file and would otherwise win.
+    cp -a /etc/ssh/sshd_config "$SSHD_BACKUP" 2>/dev/null || true
+
+    # sshd_config precedence is the opposite of most config systems: "for each
+    # keyword, the FIRST obtained value will be used". Ubuntu puts the
+    # Include for sshd_config.d at the top of sshd_config, so drop-ins are read
+    # first, in glob order — a 99- file loses to 50-cloud-init.conf. Hence 00-,
+    # plus commenting out every competing Port directive.
+    local dropin=/etc/ssh/sshd_config.d/00-remnanode-port.conf
     mkdir -p /etc/ssh/sshd_config.d
-    printf '# Managed by install-node.sh\nPort %s\n' "$SSH_PORT" > /etc/ssh/sshd_config.d/99-remnanode-port.conf
-    if grep -rqE '^\s*Port\s+' /etc/ssh/sshd_config 2>/dev/null; then
-        sed -i -E 's/^(\s*Port\s+.*)$/# \1  # superseded by sshd_config.d\/99-remnanode-port.conf/' /etc/ssh/sshd_config
+
+    sed -i -E 's/^([[:space:]]*Port[[:space:]]+.*)$/# \1  # superseded by install-node.sh/' \
+        /etc/ssh/sshd_config 2>/dev/null || true
+    local f
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [[ -e "$f" && "$f" != "$dropin" ]] || continue
+        sed -i -E 's/^([[:space:]]*Port[[:space:]]+.*)$/# \1  # superseded by install-node.sh/' "$f" 2>/dev/null || true
+    done
+
+    printf '# Managed by install-node.sh\nPort %s\n' "$SSH_PORT" > "$dropin"
+
+    # Does this image even read the drop-in directory? Some do not ship the
+    # Include line, in which case the file above is inert.
+    if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config 2>/dev/null; then
+        warn "sshd_config has no Include for sshd_config.d — writing Port directly"
+        rm -f "$dropin"
+        sshd_prepend_port
     fi
 
     if ! sshd -t 2>/dev/null; then
-        rm -f /etc/ssh/sshd_config.d/99-remnanode-port.conf
-        warn "sshd config validation failed — reverted, SSH left on port 22"
-        return 0
+        ssh_rollback
+        soft_fail "sshd rejected the new config — reverted, SSH left on port 22"
+        return 1
     fi
+
+    # Decisive check: ask sshd what it will actually bind, before restarting.
+    local effective
+    effective=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | tr '\n' ' ')
+    if [[ " $effective " != *" $SSH_PORT "* ]]; then
+        warn "effective sshd port is '${effective:-unknown}', not $SSH_PORT — retrying directly in sshd_config"
+        rm -f "$dropin"
+        sshd_prepend_port
+        effective=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | tr '\n' ' ')
+    fi
+    if [[ " $effective " != *" $SSH_PORT "* ]]; then
+        ssh_rollback
+        soft_fail "could not make sshd use port $SSH_PORT (effective: ${effective:-unknown})"
+        warn "something else in the config is pinning the port; SSH left on 22"
+        return 1
+    fi
+    ok "sshd config resolves to port $SSH_PORT"
 
     systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || true
 
     local waited=0 listening=no
-    while (( waited < 15 )); do
+    while (( waited < 20 )); do
         if ss -tlnH "sport = :$SSH_PORT" 2>/dev/null | grep -q .; then listening=yes; break; fi
         sleep 1; waited=$((waited + 1))
     done
@@ -1140,9 +1226,12 @@ migrate_ssh() {
         ok "sshd listening on $SSH_PORT — port 22 closed"
         warn "your current session stays alive; new logins must use: ssh -p $SSH_PORT root@$NODE_DOMAIN"
     else
-        rm -f /etc/ssh/sshd_config.d/99-remnanode-port.conf
+        warn "sshd did not bind $SSH_PORT. Last journal lines:"
+        journalctl -u ssh -u sshd -n 15 --no-pager 2>/dev/null | sed 's/^/       /' || true
+        ssh_rollback
         systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || true
-        warn "nothing came up on $SSH_PORT — rolled back, port 22 left open"
+        soft_fail "nothing came up on $SSH_PORT — rolled back, port 22 left open"
+        return 1
     fi
 }
 
