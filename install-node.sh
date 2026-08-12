@@ -38,7 +38,8 @@ REGRU_PASSWORD="${REGRU_PASSWORD:-}"    # reg.ru API password (set a separate on
 # Ports. These match the ufw rules opened below.
 NODE_PORT="${NODE_PORT:-2222}"          # panel -> node internal API
 SSH_PORT="${SSH_PORT:-2224}"            # new SSH port
-SELFSTEAL_PORT="${SELFSTEAL_PORT:-9443}"
+SELFSTEAL_PORT="${SELFSTEAL_PORT:-9443}"   # HTTPS, the Reality `target`
+FALLBACK_PORT="${FALLBACK_PORT:-8080}"     # plaintext HTTP, the VLESS/TLS `fallbacks.dest`
 BESZEL_PORT="${BESZEL_PORT:-45876}"
 
 # Optional knobs
@@ -840,6 +841,72 @@ install_selfsteal() {
     ok "installed on port $SELFSTEAL_PORT for $NODE_DOMAIN"
 }
 
+# A VLESS-TCP-TLS inbound terminates TLS in Xray and hands the *decrypted* bytes
+# to fallbacks.dest, so that destination must speak plaintext HTTP. Selfsteal's
+# :9443 is HTTPS (Reality needs it for raw passthrough) and :80 only issues a
+# redirect, which would loop. Hence a third listener serving the same site in
+# the clear, on loopback only.
+configure_fallback_site() {
+    step "Plaintext fallback site (VLESS-TCP-TLS)"
+
+    local cname caddyfile=""
+    for cname in $(docker ps --format '{{.Names}}' | grep -i caddy || true); do
+        caddyfile=$(docker inspect -f \
+            '{{range .Mounts}}{{if eq .Destination "/etc/caddy/Caddyfile"}}{{.Source}}{{end}}{{end}}' \
+            "$cname" 2>/dev/null || true)
+        [[ -n "$caddyfile" ]] && break
+    done
+    if [[ -z "$caddyfile" || ! -f "$caddyfile" ]]; then
+        soft_fail "could not find the selfsteal Caddyfile — skipping the fallback site"
+        return 1
+    fi
+
+    if grep -q 'remnanode-fallback' "$caddyfile"; then
+        ok "already present on :${FALLBACK_PORT}"
+        return 0
+    fi
+
+    cp -a "$caddyfile" "${caddyfile}.remnanode.bak"
+    cat >> "$caddyfile" <<EOF
+
+# remnanode-fallback — added by install-node.sh
+# Plaintext HTTP for VLESS-TCP-TLS fallbacks.dest. Xray terminates TLS itself,
+# so this listener must NOT speak TLS. Loopback only; never expose it.
+:${FALLBACK_PORT} {
+	bind 127.0.0.1
+	encode gzip
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		X-XSS-Protection "1; mode=block"
+	}
+	root * /var/www/html
+	try_files {path} /index.html
+	file_server
+}
+EOF
+
+    if ! docker exec "$cname" caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+        mv -f "${caddyfile}.remnanode.bak" "$caddyfile"
+        soft_fail "Caddy rejected the fallback site — reverted, selfsteal untouched"
+        return 1
+    fi
+
+    docker restart "$cname" >/dev/null 2>&1 || true
+    local waited=0
+    while (( waited < 30 )); do
+        if curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:${FALLBACK_PORT}/"; then
+            ok "serving plaintext HTTP on 127.0.0.1:${FALLBACK_PORT}"
+            rm -f "${caddyfile}.remnanode.bak"
+            return 0
+        fi
+        sleep 2; waited=$((waited + 2))
+    done
+    soft_fail "nothing answering on 127.0.0.1:${FALLBACK_PORT} — check: docker logs $cname"
+    return 1
+}
+
 # Locate the Let's Encrypt cert Caddy issued for our domain, inside its data volume.
 locate_certs() {
     step "Locating TLS certificate issued by selfsteal"
@@ -1350,7 +1417,7 @@ summary() {
 
        Panel node    ${NODE_NAME}  ->  ${NODE_DOMAIN}:${NODE_PORT}${REGISTERED_UUID:+  (${REGISTERED_UUID})}
        DNS           $([[ "$MANAGE_DNS" == "yes" ]] && echo "A ${NODE_DOMAIN} -> ${PUBLIC_IP} (reg.ru)" || echo "managed manually")
-       Selfsteal     https://${NODE_DOMAIN}  (Caddy on :${SELFSTEAL_PORT})
+       Selfsteal     https://${NODE_DOMAIN}  (Caddy TLS :${SELFSTEAL_PORT}, plaintext :${FALLBACK_PORT})
        TLS cert      ${CERT_PATH:-none mounted}
        SSH           $([[ "${SSH_MIGRATED:-no}" == "yes" ]] && echo "port ${SSH_PORT}" || echo "port 22 (unchanged)")
        Beszel        $(hostname) -> ${BESZEL_HUB_URL}
@@ -1364,8 +1431,10 @@ summary() {
             || echo "The A record for ${NODE_DOMAIN} must be DNS-only (grey cloud); a
           proxied Cloudflare record stops the panel reaching port ${NODE_PORT}.")
        2. In the panel, your Reality inbound's serverNames must include
-          ${NODE_DOMAIN} and its dest must point at 127.0.0.1:${SELFSTEAL_PORT},
-          otherwise the selfsteal site is never actually used.
+          ${NODE_DOMAIN} and its dest must point at 127.0.0.1:${SELFSTEAL_PORT}.
+          A VLESS-TCP-TLS inbound instead needs settings.fallbacks[].dest =
+          ${FALLBACK_PORT} plus tlsSettings.alpn = ["http/1.1"] — its fallback
+          gets decrypted bytes, so it must not point at :${SELFSTEAL_PORT}.
 
      Useful commands:
        docker logs -f remnanode
@@ -1395,6 +1464,7 @@ main() {
     configure_ufw      || true
     await_dns          || true
     install_selfsteal  || true
+    configure_fallback_site || true
     locate_certs       || true
     install_remnanode
     install_cert_watcher || true

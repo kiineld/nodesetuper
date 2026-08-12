@@ -160,6 +160,51 @@ directive in `sshd_config` and the other drop-ins, and falls back to prepending
 only closes port 22 once `ss` confirms the new port is listening. Every failure
 path restores the original `sshd_config` from a backup and leaves 22 open.
 
+## VLESS-TCP-TLS fallback
+
+Reality and TLS reach the masquerade site by different mechanisms, and they need
+different backends:
+
+| Inbound | Mechanism | Backend must be |
+|---|---|---|
+| Reality | `realitySettings.target` — raw TLS passthrough | **HTTPS** — `127.0.0.1:9443` |
+| VLESS + TLS | `settings.fallbacks[].dest` — Xray terminates TLS first | **plaintext HTTP** — `127.0.0.1:8080` |
+
+From the Xray docs: VLESS forwards to `dest` *"if, after TLS decryption"* the first
+packet fails to authenticate. The destination therefore receives cleartext, so it
+cannot be `:9443` (HTTPS), and it cannot be `:80` either — selfsteal's Caddy only
+issues a redirect there, which would loop 443 → fallback → 301 → 443.
+
+The script appends a third listener to selfsteal's Caddyfile serving the same
+`/var/www/html` in the clear on `127.0.0.1:8080`, validates it with
+`caddy validate` and rolls back if Caddy rejects it, then confirms the port
+answers. Override the port with `FALLBACK_PORT=`.
+
+Panel side, the inbound needs both a fallback and an ALPN — the docs require
+`alpn: ["http/1.1"]` on the inbound TLS whenever `fallbacks` is set:
+
+```json
+"settings": {
+  "clients": [],
+  "decryption": "none",
+  "fallbacks": [ { "dest": 8080, "xver": 1 } ]
+},
+"streamSettings": {
+  "network": "raw",
+  "security": "tls",
+  "tlsSettings": {
+    "alpn": ["http/1.1"],
+    "certificates": [ { "certificateFile": "/var/lib/remnawave/configs/xray/ssl/cert.pem",
+                        "keyFile": "/var/lib/remnawave/configs/xray/ssl/key.pem" } ],
+    "rejectUnknownSni": true
+  }
+}
+```
+
+`xver: 1` sends PROXY protocol so Caddy logs the real client IP — selfsteal's
+Caddyfile already allows it from `127.0.0.1/32`. Use `xver: 0` if anything
+misbehaves.
+
 ## Panel versions
 
 `GET /api/keygen` returns the node's key under different names depending on panel
