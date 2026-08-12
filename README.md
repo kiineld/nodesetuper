@@ -57,8 +57,15 @@ installer is interactive by design, and it rewrites nftables/iptables on a box
 already carrying ufw, Docker and Xray, so it should be a deliberate act.
 
 Option 13 fetches the latest [bol-van/zapret](https://github.com/bol-van/zapret)
-release, verifies it, and hands over to `install_easy.sh` — zapret asks its own
-questions rather than having them guessed. It runs the DPI check before
+release, verifies it, seeds `/opt/zapret/config`, and hands over to
+`install_easy.sh` — zapret asks its own questions rather than having them
+guessed. The seeding matters: `install_easy.sh` sources the config and uses each
+variable's current value as that question's default, and the shipped default is
+`NFQWS_ENABLE=0`. Press Enter through the interview without seeding and you get
+zapret installed with every mode switched off and a service that will not start.
+Seeded, the answers are already right — including `IFACE_LAN=` (NONE), since
+picking a real interface there sets up router forwarding rules a VPS does not
+want. An existing config is preserved across a reinstall rather than reset. It runs the DPI check before
 installing (a baseline, since an active bypass distorts the reading) and again
 afterwards if the service comes up. For tuning the strategy itself, zapret ships
 `blockcheck.sh`, which is the tool for that job; the path is printed at the end.

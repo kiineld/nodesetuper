@@ -1597,6 +1597,16 @@ run_dpi_check() {
     return 1
 }
 
+# Set a key in zapret's config, replacing the shipped (often commented) line.
+zapret_set_cfg() {  # zapret_set_cfg <key> <value>
+    local f="$ZAPRET_DIR/config" k=$1 v=$2
+    if grep -qE "^[#[:space:]]*${k}=" "$f" 2>/dev/null; then
+        sed -i -E "s|^[#[:space:]]*${k}=.*|${k}=${v}|" "$f"
+    else
+        printf '%s=%s\n' "$k" "$v" >> "$f"
+    fi
+}
+
 install_zapret() {
     step "Zapret (DPI bypass)"
 
@@ -1634,10 +1644,17 @@ install_zapret() {
     # sha256sum.txt does NOT cover the tarball — it lists the binaries *inside*
     # it, with paths relative to the extraction directory. So unpack first, then
     # verify the tree.
-    local have_sums=no
-    curl -fsSL --max-time 60 \
-        "https://github.com/bol-van/zapret/releases/download/${tag}/sha256sum.txt" \
-        -o "$tmp/sha256sum.txt" 2>/dev/null && have_sums=yes
+    local have_sums=no sums_code=""
+    local sums_url="https://github.com/bol-van/zapret/releases/download/${tag}/sha256sum.txt"
+    local try
+    for try in 1 2 3; do
+        sums_code=$(curl -sSL --max-time 60 -w '%{http_code}' "$sums_url" \
+                    -o "$tmp/sha256sum.txt" 2>/dev/null || echo 000)
+        if [[ "$sums_code" == "200" && -s "$tmp/sha256sum.txt" ]]; then
+            have_sums=yes; break
+        fi
+        (( try < 3 )) && sleep 3
+    done
 
     rm -rf "/opt/zapret-${tag}"
     if ! tar -xzf "$tmp/zapret.tar.gz" -C /opt; then
@@ -1656,15 +1673,42 @@ install_zapret() {
         fi
         ok "checksums verified"
     else
-        warn "could not fetch sha256sum.txt — installing unverified"
+        warn "could not fetch sha256sum.txt after 3 tries (HTTP ${sums_code:-?}) — installing unverified"
     fi
     rm -rf "$tmp"
 
+    local saved_cfg=""
+    if [[ -f "$ZAPRET_DIR/config" ]]; then
+        saved_cfg=$(mktemp)
+        cp -f "$ZAPRET_DIR/config" "$saved_cfg"
+    fi
     if [[ -d "$ZAPRET_DIR" ]]; then
         info "moving the existing $ZAPRET_DIR aside"
         mv -f "$ZAPRET_DIR" "${ZAPRET_DIR}.bak.$(date +%s)"
     fi
     mv -f "/opt/zapret-${tag}" "$ZAPRET_DIR"
+
+    # install_easy.sh copies config.default to config and sources it, then uses
+    # each variable's current value as that question's default. So seeding the
+    # config first turns the interview into "press Enter twelve times" — and
+    # without it NFQWS_ENABLE defaults to 0, which installs zapret with every
+    # mode switched off and a service that refuses to start.
+    if [[ -n "$saved_cfg" ]]; then
+        cp -f "$saved_cfg" "$ZAPRET_DIR/config"; rm -f "$saved_cfg"
+        ok "kept your existing zapret config"
+    else
+        cp -f "$ZAPRET_DIR/config.default" "$ZAPRET_DIR/config"
+        zapret_set_cfg FWTYPE nftables
+        zapret_set_cfg NFQWS_ENABLE 1
+        zapret_set_cfg TPWS_ENABLE 0
+        zapret_set_cfg TPWS_SOCKS_ENABLE 0
+        zapret_set_cfg MODE_FILTER none
+        zapret_set_cfg FLOWOFFLOAD donttouch
+        zapret_set_cfg IFACE_LAN ""
+        zapret_set_cfg IFACE_WAN ""
+        zapret_set_cfg DISABLE_IPV6 "$([[ "$DISABLE_IPV6" == "yes" ]] && echo 1 || echo 0)"
+        ok "seeded $ZAPRET_DIR/config for a server (nfqws on, no filtering, no LAN interface)"
+    fi
     if [[ ! -x "$ZAPRET_DIR/install_easy.sh" ]]; then
         soft_fail "unpacked, but $ZAPRET_DIR/install_easy.sh is missing"
         return 1
@@ -1672,9 +1716,11 @@ install_zapret() {
     ok "unpacked to $ZAPRET_DIR"
 
     echo
-    info "handing over to zapret's own installer — it asks the questions, not me."
-    info "for a server the usual answers are: mode nfqws, filter none, no"
-    info "auto-download of hostlists (so every connection is processed)."
+    info "handing over to zapret's own installer."
+    info "the config above already sets every answer, so you can press Enter"
+    info "at each prompt. The one that matters is 'enable nfqws ?' — it must"
+    info "say (default : Y). Answer NONE to 'LAN interface' on a VPS; picking a"
+    info "real interface there sets up router forwarding rules you do not want."
     echo
     "$ZAPRET_DIR/install_easy.sh" < /dev/tty || {
         soft_fail "install_easy.sh exited non-zero"
@@ -1683,9 +1729,14 @@ install_zapret() {
 
     if systemctl is-active --quiet zapret 2>/dev/null; then
         ok "zapret service is running"
+    elif [[ "$(grep -E '^NFQWS_ENABLE=' "$ZAPRET_DIR/config" 2>/dev/null | tail -1)" == "NFQWS_ENABLE=0" ]]; then
+        soft_fail "zapret installed with every mode disabled — nothing to run"
+        warn "you answered N to 'enable nfqws ?'. Fix it with either:"
+        warn "  sed -i 's/^NFQWS_ENABLE=0/NFQWS_ENABLE=1/' $ZAPRET_DIR/config && systemctl restart zapret"
+        warn "  $ZAPRET_DIR/install_easy.sh     # and answer Y to nfqws"
     else
-        warn "zapret is installed but the service is not active"
-        warn "start it with: systemctl enable --now zapret"
+        soft_fail "zapret is installed but the service is not active"
+        warn "check: systemctl status zapret; journalctl -u zapret -n 30"
     fi
     info "to search for a working strategy, run: $ZAPRET_DIR/blockcheck.sh"
     return 0
