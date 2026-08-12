@@ -44,8 +44,39 @@ Run it with **no arguments** and you get a menu instead of a full install:
    10)  WARP                       warp-native, or reuse a wgcf profile
    11)  Beszel agent               install and enrol with the hub
    12)  SSH port -> 2224           verified before port 22 is closed
+
+   optional
+   13)  Zapret (DPI bypass)       download + run zapret's own installer
+   14)  DPI check (test 4)        TCP 16-20KB blocking, before/after zapret
+
     0)  Quit
 ```
+
+**13 and 14 are menu-only** — neither runs as part of a full install. Zapret's
+installer is interactive by design, and it rewrites nftables/iptables on a box
+already carrying ufw, Docker and Xray, so it should be a deliberate act.
+
+Option 13 fetches the latest [bol-van/zapret](https://github.com/bol-van/zapret)
+release, verifies it, and hands over to `install_easy.sh` — zapret asks its own
+questions rather than having them guessed. It runs the DPI check before
+installing (a baseline, since an active bypass distorts the reading) and again
+afterwards if the service comes up. For tuning the strategy itself, zapret ships
+`blockcheck.sh`, which is the tool for that job; the path is printed at the end.
+
+Option 14 runs test 4 of
+[dpi-detector](https://github.com/Runnin4ik/dpi-detector) — TCP 16-20KB
+blocking, where connections to CDNs and hostings are killed after ~14-34KB:
+
+```bash
+docker run --rm --pull=always ghcr.io/runnin4ik/dpi-detector:latest -t 4 --batch
+```
+
+Logs land in `/var/log/dpi-detector/`.
+
+Note on the release checksums: `sha256sum.txt` does **not** cover the tarball —
+it lists the binaries *inside* it, with paths relative to the extraction
+directory. So the script unpacks first and verifies the tree, refusing to
+install if any file fails.
 
 Each action asks only for what it needs — picking *Firewall* wants the panel URL
 and token (to lock port 2222 to the panel's IP) and nothing about beszel or DNS.

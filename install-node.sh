@@ -68,6 +68,9 @@ REMNA_TOKEN="${REMNA_TOKEN:-}"
 BESZEL_EMAIL="${BESZEL_EMAIL:-}"
 BESZEL_PASSWORD="${BESZEL_PASSWORD:-}"
 
+ZAPRET_DIR="${ZAPRET_DIR:-/opt/zapret}"
+DPI_LOG_DIR=/var/log/dpi-detector
+
 INSTALL_DIR="/opt/remnanode"
 XRAY_SSL_DIR="/var/lib/remnawave/configs/xray/ssl"
 LOG_FILE="/var/log/remnanode-autoinstall.log"
@@ -1564,6 +1567,130 @@ run_all() {
     summary
 }
 
+# --- Optional extras -------------------------------------------------------
+# Neither of these runs as part of a full install: zapret's installer is
+# interactive by design, and it rewrites nftables/iptables rules on a box that
+# is already carrying ufw, Docker and Xray. Both live in the menu only.
+
+# Test 4 of dpi-detector: TCP 16-20KB blocking — connections to CDNs and
+# hostings killed after ~14-34KB. Read the result before and after touching
+# zapret; the tool's own README notes an active bypass distorts the numbers.
+run_dpi_check() {
+    step "DPI check — TCP 16-20KB blocking (dpi-detector test 4)"
+    if ! have docker; then
+        soft_fail "docker is not installed — run menu option 2 first"
+        return 1
+    fi
+    mkdir -p "$DPI_LOG_DIR"
+    local out
+    out="${DPI_LOG_DIR}/${1:-check}-$(date +%Y%m%d-%H%M%S).log"
+    info "ghcr.io/runnin4ik/dpi-detector:latest -t 4 --batch"
+    info "this takes a couple of minutes"
+    echo
+    if docker run --rm --pull=always ghcr.io/runnin4ik/dpi-detector:latest \
+            -t 4 --batch 2>&1 | tee "$out"; then
+        echo
+        ok "saved to $out"
+        return 0
+    fi
+    soft_fail "dpi-detector did not complete"
+    return 1
+}
+
+install_zapret() {
+    step "Zapret (DPI bypass)"
+
+    if systemctl is-active --quiet zapret 2>/dev/null; then
+        ok "zapret is already running"
+        info "reconfigure:      $ZAPRET_DIR/install_easy.sh"
+        info "find a strategy:  $ZAPRET_DIR/blockcheck.sh"
+        return 0
+    fi
+
+    warn "zapret inserts NFQUEUE rules into nftables/iptables. This box already"
+    warn "runs ufw, Docker and Xray, so take the node out of rotation first if"
+    warn "you cannot afford a blip."
+    echo
+
+    local tag url tmp
+    tag=$(curl -sSL --max-time 30 https://api.github.com/repos/bol-van/zapret/releases/latest \
+          | jq -r '.tag_name // empty' 2>/dev/null || true)
+    if [[ -z "$tag" ]]; then
+        soft_fail "could not resolve the latest zapret release"
+        return 1
+    fi
+    info "latest release: $tag"
+
+    tmp=$(mktemp -d)
+    url="https://github.com/bol-van/zapret/releases/download/${tag}/zapret-${tag}.tar.gz"
+    if ! curl -fSL --max-time 300 "$url" -o "$tmp/zapret.tar.gz"; then
+        rm -rf "$tmp"
+        soft_fail "could not download $url"
+        warn "GitHub releases are often unreachable from RU networks — fetch the"
+        warn "tarball elsewhere, drop it in $tmp, and run $ZAPRET_DIR/install_easy.sh"
+        return 1
+    fi
+
+    # sha256sum.txt does NOT cover the tarball — it lists the binaries *inside*
+    # it, with paths relative to the extraction directory. So unpack first, then
+    # verify the tree.
+    local have_sums=no
+    curl -fsSL --max-time 60 \
+        "https://github.com/bol-van/zapret/releases/download/${tag}/sha256sum.txt" \
+        -o "$tmp/sha256sum.txt" 2>/dev/null && have_sums=yes
+
+    rm -rf "/opt/zapret-${tag}"
+    if ! tar -xzf "$tmp/zapret.tar.gz" -C /opt; then
+        rm -rf "$tmp"
+        soft_fail "could not unpack zapret"
+        return 1
+    fi
+
+    if [[ "$have_sums" == "yes" ]]; then
+        local bad
+        bad=$(cd /opt && sha256sum -c "$tmp/sha256sum.txt" 2>/dev/null | grep -c 'FAILED' || true)
+        if [[ "${bad:-0}" -gt 0 ]]; then
+            rm -rf "/opt/zapret-${tag}" "$tmp"
+            soft_fail "$bad file(s) failed checksum verification — refusing to install"
+            return 1
+        fi
+        ok "checksums verified"
+    else
+        warn "could not fetch sha256sum.txt — installing unverified"
+    fi
+    rm -rf "$tmp"
+
+    if [[ -d "$ZAPRET_DIR" ]]; then
+        info "moving the existing $ZAPRET_DIR aside"
+        mv -f "$ZAPRET_DIR" "${ZAPRET_DIR}.bak.$(date +%s)"
+    fi
+    mv -f "/opt/zapret-${tag}" "$ZAPRET_DIR"
+    if [[ ! -x "$ZAPRET_DIR/install_easy.sh" ]]; then
+        soft_fail "unpacked, but $ZAPRET_DIR/install_easy.sh is missing"
+        return 1
+    fi
+    ok "unpacked to $ZAPRET_DIR"
+
+    echo
+    info "handing over to zapret's own installer — it asks the questions, not me."
+    info "for a server the usual answers are: mode nfqws, filter none, no"
+    info "auto-download of hostlists (so every connection is processed)."
+    echo
+    "$ZAPRET_DIR/install_easy.sh" < /dev/tty || {
+        soft_fail "install_easy.sh exited non-zero"
+        return 1
+    }
+
+    if systemctl is-active --quiet zapret 2>/dev/null; then
+        ok "zapret service is running"
+    else
+        warn "zapret is installed but the service is not active"
+        warn "start it with: systemctl enable --now zapret"
+    fi
+    info "to search for a working strategy, run: $ZAPRET_DIR/blockcheck.sh"
+    return 0
+}
+
 # --- Menu ------------------------------------------------------------------
 
 action_done() {
@@ -1600,6 +1727,10 @@ ${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLI
    11)  Beszel agent               install and enrol with the hub
    12)  SSH port -> ${SSH_PORT}            verified before port 22 is closed
 
+   ${C_YEL}optional${C_RESET}
+   13)  Zapret (DPI bypass)       download + run zapret's own installer
+   14)  DPI check (test 4)        TCP 16-20KB blocking, before/after zapret
+
     0)  Quit
 
 MENU
@@ -1609,7 +1740,7 @@ menu() {
     local choice
     while :; do
         show_menu
-        prompt "choose [0-12]: "
+        prompt "choose [0-14]: "
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
@@ -1634,6 +1765,14 @@ menu() {
            11)  need_domain; need_beszel; beszel_login || true
                 install_beszel || true; action_done ;;
            12)  migrate_ssh || true; action_done ;;
+           13)  run_dpi_check before || true
+                install_zapret || true
+                if systemctl is-active --quiet zapret 2>/dev/null; then
+                    info "re-checking with zapret active"
+                    run_dpi_check after || true
+                fi
+                action_done ;;
+           14)  run_dpi_check manual || true; action_done ;;
             0|q|quit|exit) printf '
 '; return 0 ;;
             "") ;;
