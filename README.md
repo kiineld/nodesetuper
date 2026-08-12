@@ -27,17 +27,41 @@ value — you never type an IP.
 Answer `no` to the DNS prompt (or set `MANAGE_DNS=no`) to manage the record
 yourself; the script then asks for the full hostname instead of a label.
 
-Every prompt has an environment-variable equivalent, so it also runs unattended:
+## Arguments
+
+Any prompt can be pre-answered as a `key=value` argument, in any order. Whatever
+you leave out is still asked for interactively, so you can fill in as much or as
+little as you like:
 
 ```bash
-NODE_SUBDOMAIN=de1 NODE_NAME=DE-1 REMNA_TOKEN=xxx \
-BESZEL_EMAIL=me@example.com BESZEL_PASSWORD=yyy \
-REGRU_PASSWORD=zzz DISABLE_IPV6=yes \
-bash install-node.sh
+bash <(curl -Ls https://raw.githubusercontent.com/kiineld/nodesetuper/main/install-node.sh) \
+  rpanelurl=https://panelservice.rustafield.site sub=de1 name=DE-1
 ```
 
-The beszel account must be a **regular user**, not a superuser — the hub refuses
-to issue universal tokens to superusers.
+Keys are case- and separator-insensitive: `rpanelurl=`, `RPANEL_URL=`, `--panel-url=`
+all set the same thing. Run `--help` for the full list. Environment variables work too.
+
+Values passed as arguments are visible to other users via `ps` and land in your
+shell history — for secrets, prefer letting the script prompt you.
+
+## When something fails
+
+Only two things are fatal: an invalid panel token, and the node container failing
+to start. Everything else — DNS, selfsteal, beszel, WARP, the SSH port change —
+reports the failure, records it, and carries on. The run ends with a list:
+
+```
+     Finished with 2 step(s) skipped or failed:
+       ✗ Beszel hub — login failed: ...
+       ✗ DNS — reg.ru refused this server's IP (1.2.3.4)
+     The node itself is up; re-run to retry just these.
+```
+
+Re-running is safe and picks up where it left off.
+
+The beszel account must be an **ordinary user**, not a superuser — the hub refuses
+to issue universal tokens to superusers. See [Beszel login](#beszel-login) if it
+fails.
 
 ## What it does
 
@@ -99,6 +123,35 @@ The panel IP is resolved from `PANEL_URL`; override with `PANEL_IP=`. If it cann
 be resolved the script opens 2222 to everyone and says so loudly.
 
 A re-run does **not** reset ufw, so hand-added rules survive.
+
+## Beszel login
+
+If you get **"The request doesn't satisfy the collection requirements to
+authenticate"**, that is PocketBase rejecting the login before it ever checks the
+password. From beszel's `collections.go`:
+
+```go
+usersCollection.PasswordAuth.Enabled = disablePasswordAuth != "true"
+usersCollection.PasswordAuth.IdentityFields = []string{"email"}
+```
+
+So, in order of likelihood:
+
+1. **The hub runs with `DISABLE_PASSWORD_AUTH=true`** — password auth is off on the `users` collection entirely (OIDC-only setups).
+2. **You gave a username** — the only accepted identity field is the **email address**.
+3. **The account is a superuser.** Superusers live in a different collection (`_superusers`). The script now tries that one too, but superusers cannot mint universal tokens, so enrolment stays manual.
+4. **MFA is enabled** — the first factor returns a challenge, not a token, which cannot be completed unattended.
+
+The script reports which of these applies and continues without beszel. To skip
+the login altogether, pass the two values directly — both are on the hub, under
+Settings → Tokens and the *Add system* dialog:
+
+```bash
+bkey='ssh-ed25519 AAAA...' btoken=<universal-token-uuid>
+```
+
+With a key but no token the agent still installs; you just add the system on the
+hub by hand (host = your node domain, port 45876).
 
 ## Kernel tuning
 

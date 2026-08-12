@@ -8,12 +8,16 @@
 # kernel tuning + BBR, ufw, selfsteal (Caddy), Let's Encrypt certs wired into
 # Xray, WARP, beszel agent, SSH hardening, and registration with the panel.
 #
-# Every prompt can be pre-answered with an environment variable, so the script
-# is equally usable unattended:
+# Any prompt can be pre-answered as a key=value argument or an environment
+# variable; whatever you leave out is still asked for interactively:
 #
-#   NODE_DOMAIN=de1.example.com NODE_NAME=DE-1 REMNA_TOKEN=... \
-#   BESZEL_EMAIL=me@example.com BESZEL_PASSWORD=... DISABLE_IPV6=yes \
-#   bash install-node.sh
+#   bash <(curl -Ls .../install-node.sh) rpanelurl=https://panel.example.com \
+#       sub=de1 name=DE-1 rtoken=xxxxx
+#
+# Run with --help for the full list of keys.
+#
+# Optional steps (DNS, selfsteal, beszel, WARP, SSH port) report a failure and
+# carry on; only the panel token and the node container itself are fatal.
 #
 set -Eeuo pipefail
 
@@ -75,11 +79,26 @@ REGISTERED_UUID=""
 ACTIVE_INBOUNDS_JSON="[]"
 
 STEP_NO=0
-step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s==> [%02d] %s%s\n' "$C_BLU" "$STEP_NO" "$*" "$C_RESET"; }
+CURRENT_STEP=""
+FAILED_STEPS=()
+
+step() {
+    STEP_NO=$((STEP_NO + 1)); CURRENT_STEP="$*"
+    printf '\n%s==> [%02d] %s%s\n' "$C_BLU" "$STEP_NO" "$*" "$C_RESET"
+}
 info() { printf '     %s\n' "$*"; }
 ok()   { printf '     %s✓%s %s\n' "$C_GRN" "$C_RESET" "$*"; }
 warn() { printf '     %s!%s %s\n' "$C_YEL" "$C_RESET" "$*"; }
 die()  { printf '\n%s✗ %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+
+# Failure inside an OPTIONAL step. Records it for the closing summary and
+# returns 0, so the caller writes `... || { soft_fail "why"; return 1; }` and the
+# run carries on. Anything that would leave a broken node still uses die().
+soft_fail() {
+    printf '     %s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+    FAILED_STEPS+=("${CURRENT_STEP} — $*")
+    return 0
+}
 
 on_error() {
     local exit_code=$? line=$1
@@ -151,6 +170,96 @@ ask_yes_no() {  # ask_yes_no <varname> <prompt> <default yes|no>
 strip_slash() { printf '%s' "${1%/}"; }
 
 # ---------------------------------------------------------------------------
+# Arguments: key=value pairs, in any order. Anything you leave out is prompted
+# for exactly as before, so you can fill in as much or as little as you like.
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<'USAGE'
+Usage: install-node.sh [key=value ...]
+
+  Every setting can be given as key=value; whatever you omit is prompted for.
+
+  Panel      rpanelurl=   https://panel.example.com
+             rtoken=      Remnawave API token
+             profile=     config profile UUID        panelip=  override panel IP
+  Node       name=        node name (3-30 chars)     nodeport= default 2222
+             domain=      full hostname (when dns=no)
+  DNS        dns=         yes|no                     zone=     example.com
+             sub=         subdomain label, or @      reguser=  reg.ru login
+             regpass=     reg.ru API password
+  Beszel     beszelurl=   https://beszel.example.com
+             bemail=      hub email                  bpass=    hub password
+             bkey=        hub public key             btoken=   universal token
+                          (bkey + btoken skip the hub login entirely)
+  System     ipv6=        keep|disable               sshport=  default 2224
+             skipwarp=    yes|no                     skipssh=  yes|no
+
+  Example:
+    install-node.sh rpanelurl=https://panel.example.com sub=de1 name=DE-1
+
+  Note: values passed this way are visible to other users via `ps` and land in
+  your shell history. For secrets, prefer letting the script prompt you.
+USAGE
+}
+
+set_var() { printf -v "$1" '%s' "$2"; }
+
+parse_args() {
+    local arg key val
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help|help) usage; exit 0 ;;
+        esac
+        if [[ "$arg" != *=* ]]; then
+            warn "ignoring argument (expected key=value): $arg"
+            continue
+        fi
+        key="${arg%%=*}"; val="${arg#*=}"
+        key="${key#--}"
+        # Fold case and drop separators, so RPANELURL, rpanel-url and
+        # PANEL_URL all land on the same setting.
+        key="$(printf '%s' "$key" | tr -d '_-' | tr '[:upper:]' '[:lower:]')"
+        case "$key" in
+            panelurl|rpanelurl|panel|remnaurl)          set_var PANEL_URL "$val" ;;
+            remnatoken|rtoken|token|apikey|panelkey)    set_var REMNA_TOKEN "$val" ;;
+            panelip)                                    set_var PANEL_IP "$val" ;;
+            panelextraheader|extraheader)               set_var PANEL_EXTRA_HEADER "$val" ;;
+            configprofileuuid|profile)                  set_var CONFIG_PROFILE_UUID "$val" ;;
+            nodename|name)                              set_var NODE_NAME "$val" ;;
+            nodedomain|domain|fqdn|host)                set_var NODE_DOMAIN "$val" ;;
+            nodesubdomain|subdomain|sub)                set_var NODE_SUBDOMAIN "$val" ;;
+            nodeport)                                   set_var NODE_PORT "$val" ;;
+            countrycode|country|cc)                     set_var COUNTRY_CODE "$val" ;;
+            managedns|dns)                              set_var MANAGE_DNS "$val" ;;
+            regruzone|zone)                             set_var REGRU_ZONE "$val" ;;
+            regruuser|reguser|regrulogin)               set_var REGRU_USER "$val" ;;
+            regrupassword|regrupass|regpass)            set_var REGRU_PASSWORD "$val" ;;
+            dnswaitseconds|dnswait)                     set_var DNS_WAIT_SECONDS "$val" ;;
+            beszelhuburl|beszelurl|huburl|bhub)         set_var BESZEL_HUB_URL "$val" ;;
+            beszelemail|bemail|beszeluser)              set_var BESZEL_EMAIL "$val" ;;
+            beszelpassword|beszelpass|bpass)            set_var BESZEL_PASSWORD "$val" ;;
+            beszelkey|bkey)                             set_var BESZEL_KEY "$val" ;;
+            beszeltoken|btoken)                         set_var BESZEL_TOKEN "$val" ;;
+            beszelpermanenttoken|btokenpermanent)       set_var BESZEL_PERMANENT_TOKEN "$val" ;;
+            beszelport)                                 set_var BESZEL_PORT "$val" ;;
+            disableipv6|ipv6disable|noipv6)             set_var DISABLE_IPV6 "$val" ;;
+            ipv6)  # ipv6=keep / ipv6=disable reads better than a double negative
+                case "${val,,}" in
+                    disable|off|no|false) set_var DISABLE_IPV6 yes ;;
+                    *)                    set_var DISABLE_IPV6 no  ;;
+                esac ;;
+            sshport)                                    set_var SSH_PORT "$val" ;;
+            selfstealport)                              set_var SELFSTEAL_PORT "$val" ;;
+            skipwarp|nowarp)                            set_var SKIP_WARP "$val" ;;
+            skipsshport|skipssh)                        set_var SKIP_SSH_PORT "$val" ;;
+            installdir)                                 set_var INSTALL_DIR "$val" ;;
+            *) warn "unknown argument: ${arg%%=*}  (run with --help for the list)" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Remnawave panel API
 # ---------------------------------------------------------------------------
 
@@ -182,11 +291,33 @@ rw_error() {  # human-readable panel error
 # Beszel hub API (PocketBase)
 # ---------------------------------------------------------------------------
 
-BESZEL_AUTH=""; BESZEL_KEY=""; BESZEL_TOKEN=""
+BESZEL_AUTH=""
+BESZEL_KEY="${BESZEL_KEY:-}"
+BESZEL_TOKEN="${BESZEL_TOKEN:-}"
+BESZEL_IS_SUPERUSER=no
+BZ_LAST_ERROR=""
+BZ_MFA=""
 
 bz_get() {  # bz_get <path>
     curl -sS --max-time 30 -H "Authorization: ${BESZEL_AUTH}" -H "Accept: application/json" \
         "${BESZEL_HUB_URL}$1"
+}
+
+# PocketBase keeps ordinary users and superusers in separate auth collections,
+# and rejects a login against the wrong one with "the request doesn't satisfy
+# the collection requirements to authenticate". Try both.
+bz_auth_try() {  # bz_auth_try <collection>
+    local coll=$1 payload resp
+    payload=$(jq -nc --arg i "$BESZEL_EMAIL" --arg p "$BESZEL_PASSWORD" '{identity:$i, password:$p}')
+    resp=$(curl -sS --max-time 30 -X POST -H "Content-Type: application/json" \
+        --data-binary "$payload" \
+        "${BESZEL_HUB_URL}/api/collections/${coll}/auth-with-password" 2>/dev/null || true)
+    BZ_LAST_ERROR=$(printf '%s' "$resp" | jq -r '.message // empty' 2>/dev/null || true)
+    BESZEL_AUTH=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+    # With MFA on, PocketBase answers a first-factor login with an mfaId and no
+    # token, which is not something this script can complete unattended.
+    BZ_MFA=$(printf '%s' "$resp" | jq -r '.mfaId // empty' 2>/dev/null || true)
+    [[ -n "$BESZEL_AUTH" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -293,8 +424,12 @@ gather_input() {
 
     ask NODE_NAME "Node name (panel + beszel)"
     ask_secret REMNA_TOKEN "Remnawave API token"
-    ask BESZEL_EMAIL "Beszel hub email (a regular user, NOT a superuser)"
-    ask_secret BESZEL_PASSWORD "Beszel hub password"
+    if [[ -n "$BESZEL_KEY" && -n "$BESZEL_TOKEN" ]]; then
+        info "beszel key and token supplied — no hub login needed"
+    else
+        ask BESZEL_EMAIL "Beszel hub email (an ordinary user, NOT a superuser)"
+        ask_secret BESZEL_PASSWORD "Beszel hub password"
+    fi
     ask_yes_no DISABLE_IPV6 "Disable IPv6 on this server?" "no"
 
     [[ ${#NODE_NAME} -ge 3 && ${#NODE_NAME} -le 30 ]] \
@@ -371,32 +506,71 @@ resolve_config_profile() {
 }
 
 beszel_login() {
-    step "Authenticating with beszel hub"
-    local payload resp
-    payload=$(jq -nc --arg i "$BESZEL_EMAIL" --arg p "$BESZEL_PASSWORD" '{identity:$i, password:$p}')
-    resp=$(curl -sS --max-time 30 -X POST -H "Content-Type: application/json" \
-        --data-binary "$payload" \
-        "${BESZEL_HUB_URL}/api/collections/users/auth-with-password" 2>/dev/null || true)
+    step "Beszel hub"
 
-    BESZEL_AUTH=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-    [[ -n "$BESZEL_AUTH" ]] || die "beszel login failed: $(printf '%s' "$resp" | jq -r '.message // .' 2>/dev/null | head -c 200)"
-    ok "logged in as $BESZEL_EMAIL"
+    if [[ -n "$BESZEL_KEY" && -n "$BESZEL_TOKEN" ]]; then
+        ok "key and token supplied directly — skipping the hub login"
+        return 0
+    fi
+    if [[ -z "$BESZEL_EMAIL" || -z "$BESZEL_PASSWORD" ]]; then
+        soft_fail "no hub credentials given — beszel will be skipped"
+        return 1
+    fi
 
-    BESZEL_KEY=$(bz_get /api/beszel/getkey | jq -r '.key // empty')
-    [[ -n "$BESZEL_KEY" ]] || die "could not read the hub public key from /api/beszel/getkey"
+    if bz_auth_try users; then
+        ok "logged in to the 'users' collection as $BESZEL_EMAIL"
+    elif bz_auth_try _superusers; then
+        BESZEL_IS_SUPERUSER=yes
+        ok "logged in as a superuser"
+        warn "the hub refuses universal tokens to superusers, by design"
+        warn "for hands-off enrolment, make an ordinary user at ${BESZEL_HUB_URL}/_/#/collections?collection=users"
+    elif [[ -n "${BZ_MFA:-}" ]]; then
+        soft_fail "beszel requires a second factor (MFA) — cannot log in unattended"
+        warn "read the key and universal token off the hub yourself and pass them:"
+        warn "  bkey='ssh-ed25519 ...' btoken=<uuid>"
+        return 1
+    else
+        soft_fail "beszel login failed: ${BZ_LAST_ERROR:-no token returned}"
+        warn "tried both the 'users' and '_superusers' collections. That message from"
+        warn "PocketBase has three usual causes, in order of likelihood:"
+        warn "  1. the hub runs with DISABLE_PASSWORD_AUTH=true (OIDC-only login)"
+        warn "  2. you gave a username — the identity field is the EMAIL address"
+        warn "  3. no such account: create an ordinary user (not a superuser) at"
+        warn "     ${BESZEL_HUB_URL}/_/#/collections?collection=users"
+        warn "either way you can skip the login entirely by passing the values:"
+        warn "  bkey='ssh-ed25519 ...' btoken=<uuid>"
+        warn "both are on the hub under Settings -> Tokens / Add system."
+        return 1
+    fi
+
+    BESZEL_KEY=$(bz_get /api/beszel/getkey | jq -r '.key // empty' 2>/dev/null || true)
+    if [[ -z "$BESZEL_KEY" ]]; then
+        soft_fail "could not read the hub public key from /api/beszel/getkey"
+        return 1
+    fi
     ok "hub public key retrieved"
 
+    if [[ "$BESZEL_IS_SUPERUSER" == "yes" ]]; then
+        warn "no universal token — the agent installs, but you must add this system"
+        warn "on the hub manually (host ${NODE_DOMAIN}, port ${BESZEL_PORT})"
+        return 0
+    fi
+
     local tok_resp
-    tok_resp=$(bz_get /api/beszel/universal-token)
-    if [[ "$(printf '%s' "$tok_resp" | jq -r '.active // false')" == "true" ]]; then
+    tok_resp=$(bz_get /api/beszel/universal-token 2>/dev/null || true)
+    if [[ "$(printf '%s' "$tok_resp" | jq -r '.active // false' 2>/dev/null)" == "true" ]]; then
         BESZEL_TOKEN=$(printf '%s' "$tok_resp" | jq -r '.token')
         info "reusing the universal token already active on the hub"
     else
         local q="/api/beszel/universal-token?enable=1"
         [[ "${BESZEL_PERMANENT_TOKEN,,}" == "yes" ]] && q+="&permanent=1"
-        tok_resp=$(bz_get "$q")
-        BESZEL_TOKEN=$(printf '%s' "$tok_resp" | jq -r '.token // empty')
-        [[ -n "$BESZEL_TOKEN" ]] || die "could not obtain a universal token (superusers cannot use them — use a regular user account)"
+        tok_resp=$(bz_get "$q" 2>/dev/null || true)
+        BESZEL_TOKEN=$(printf '%s' "$tok_resp" | jq -r '.token // empty' 2>/dev/null || true)
+        if [[ -z "$BESZEL_TOKEN" ]]; then
+            warn "could not obtain a universal token — the agent will still be installed,"
+            warn "but you must add this system on the hub manually"
+            return 0
+        fi
         if [[ "$(printf '%s' "$tok_resp" | jq -r '.permanent // false')" == "true" ]]; then
             info "enabled a permanent universal token on the hub"
         else
@@ -412,35 +586,36 @@ setup_dns() {
     fi
     step "DNS record via reg.ru"
 
-    regru_api nop || die "cannot reach api.reg.ru"
+    regru_api nop || { soft_fail "cannot reach api.reg.ru"; return 1; }
     if ! regru_ok; then
         local code
         code=$(printf '%s' "$REGRU_BODY" | jq -r '.error_code // "UNKNOWN"')
         # reg.ru checks the IP allowlist before it checks the password, so this
         # is the first thing a brand-new server hits.
         if [[ "$code" == "ACCESS_DENIED_FROM_IP" ]]; then
-            die "reg.ru refused this server's IP.
-
-     This host is ${PUBLIC_IP}, and that address is not on your REG.API allowlist.
-     Add it (or allow all addresses) at
-       https://www.reg.ru/user/account/#/settings/api/
-     then re-run. Nothing has been changed on this server yet.
-
-     Deploying many short-lived nodes? Either allow all addresses, or run with
-     MANAGE_DNS=no and point the record at ${PUBLIC_IP} yourself."
+            soft_fail "reg.ru refused this server's IP ($PUBLIC_IP)"
+            warn "add it (or allow all addresses) at"
+            warn "  https://www.reg.ru/user/account/#/settings/api/"
+            warn "then re-run. Continuing without DNS: the record will not exist,"
+            warn "so ACME will fail and selfsteal falls back to a self-signed cert."
+        else
+            soft_fail "reg.ru rejected the request: $(regru_err)"
         fi
-        die "reg.ru rejected the request: $(regru_err)"
+        return 1
     fi
     ok "authenticated as $REGRU_USER"
 
     # Zone management only works when the domain actually uses reg.ru nameservers.
-    regru_api zone/nop || die "zone/nop request failed"
-    regru_zone_ok || die "cannot manage the DNS zone for $REGRU_ZONE: $(regru_zone_err)
-     The domain must use ns1.reg.ru and ns2.reg.ru."
+    regru_api zone/nop || { soft_fail "zone/nop request failed"; return 1; }
+    if ! regru_zone_ok; then
+        soft_fail "cannot manage the DNS zone for $REGRU_ZONE: $(regru_zone_err)"
+        warn "the domain must use ns1.reg.ru and ns2.reg.ru"
+        return 1
+    fi
     ok "zone $REGRU_ZONE is manageable"
 
-    regru_api zone/get_resource_records || die "cannot read the zone records"
-    regru_zone_ok || die "cannot read the zone records: $(regru_zone_err)"
+    regru_api zone/get_resource_records || { soft_fail "cannot read the zone records"; return 1; }
+    regru_zone_ok || { soft_fail "cannot read the zone records: $(regru_zone_err)"; return 1; }
 
     local existing
     existing=$(printf '%s' "$REGRU_BODY" | jq -r --arg s "$NODE_SUBDOMAIN" \
@@ -456,15 +631,16 @@ setup_dns() {
         local old
         for old in $existing; do
             regru_api zone/remove_record "$(jq -nc --arg s "$NODE_SUBDOMAIN" --arg c "$old" \
-                '{subdomain:$s, record_type:"A", content:$c}')" || die "remove_record request failed"
-            regru_zone_ok || die "could not remove the stale A record $old: $(regru_zone_err)"
+                '{subdomain:$s, record_type:"A", content:$c}')" \
+                || { soft_fail "remove_record request failed"; return 1; }
+            regru_zone_ok || { soft_fail "could not remove the stale A record $old: $(regru_zone_err)"; return 1; }
             info "removed stale A record $old"
         done
     fi
 
     regru_api zone/add_alias "$(jq -nc --arg s "$NODE_SUBDOMAIN" --arg ip "$PUBLIC_IP" \
-        '{subdomain:$s, ipaddr:$ip}')" || die "add_alias request failed"
-    regru_zone_ok || die "could not create the A record: $(regru_zone_err)"
+        '{subdomain:$s, ipaddr:$ip}')" || { soft_fail "add_alias request failed"; return 1; }
+    regru_zone_ok || { soft_fail "could not create the A record: $(regru_zone_err)"; return 1; }
     ok "A record $NODE_DOMAIN -> $PUBLIC_IP created"
 }
 
@@ -634,9 +810,12 @@ install_selfsteal() {
     if docker ps --format '{{.Names}}' | grep -qi 'caddy'; then
         info "a caddy container is already running — reconfiguring"
     fi
-    bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install \
-        --force --domain "$NODE_DOMAIN" --port "$SELFSTEAL_PORT" \
-        || die "selfsteal install failed"
+    if ! bash <(curl -Ls https://github.com/DigneZzZ/remnawave-scripts/raw/main/selfsteal.sh) @ install \
+            --force --domain "$NODE_DOMAIN" --port "$SELFSTEAL_PORT"; then
+        soft_fail "selfsteal install failed"
+        warn "no masquerade site and no ACME certificate; the node still comes up"
+        return 1
+    fi
     ok "installed on port $SELFSTEAL_PORT for $NODE_DOMAIN"
 }
 
@@ -849,20 +1028,39 @@ install_warp() {
 
 install_beszel() {
     step "Beszel agent"
-    curl -sL https://get.beszel.dev -o /tmp/install-beszel.sh
+    if [[ -z "$BESZEL_KEY" ]]; then
+        soft_fail "no hub public key — skipping the agent"
+        warn "install it later with: curl -sL https://get.beszel.dev | sh -s -- -k '<key>' -p ${BESZEL_PORT} -t '<token>' -url ${BESZEL_HUB_URL}"
+        return 1
+    fi
+
+    curl -sL https://get.beszel.dev -o /tmp/install-beszel.sh || {
+        soft_fail "could not download the beszel installer"; return 1; }
     chmod +x /tmp/install-beszel.sh
-    /tmp/install-beszel.sh \
-        -k "$BESZEL_KEY" \
-        -p "$BESZEL_PORT" \
-        -t "$BESZEL_TOKEN" \
-        -url "$BESZEL_HUB_URL" \
-        || die "beszel agent install failed"
+
+    # -t/-url are optional; without a token the agent runs but does not
+    # self-register, so the system has to be added on the hub by hand.
+    local args=(-k "$BESZEL_KEY" -p "$BESZEL_PORT" -url "$BESZEL_HUB_URL")
+    [[ -n "$BESZEL_TOKEN" ]] && args+=(-t "$BESZEL_TOKEN")
+
+    if ! /tmp/install-beszel.sh "${args[@]}"; then
+        rm -f /tmp/install-beszel.sh
+        soft_fail "beszel agent install failed"
+        return 1
+    fi
     rm -f /tmp/install-beszel.sh
     sleep 3
     if systemctl is-active --quiet beszel-agent 2>/dev/null; then
-        ok "agent running — it should now appear on the hub automatically"
+        if [[ -n "$BESZEL_TOKEN" ]]; then
+            ok "agent running — it should now appear on the hub automatically"
+        else
+            ok "agent running"
+            warn "no token was available: add this system on the hub yourself"
+            warn "  host ${NODE_DOMAIN}, port ${BESZEL_PORT}"
+        fi
     else
-        warn "beszel-agent is not active — check: journalctl -u beszel-agent -n 50"
+        soft_fail "beszel-agent is not active — check: journalctl -u beszel-agent -n 50"
+        return 1
     fi
 }
 
@@ -922,6 +1120,15 @@ migrate_ssh() {
 
 summary() {
     step "Done"
+
+    if ((${#FAILED_STEPS[@]})); then
+        printf '\n     %sFinished with %d step(s) skipped or failed:%s\n' \
+            "$C_YEL" "${#FAILED_STEPS[@]}" "$C_RESET"
+        local f
+        for f in "${FAILED_STEPS[@]}"; do printf '       %s✗%s %s\n' "$C_RED" "$C_RESET" "$f"; done
+        printf '     %sThe node itself is up; re-run to retry just these.%s\n' "$C_YEL" "$C_RESET"
+    fi
+
     cat <<SUMMARY
 
      ${C_GRN}Node provisioned.${C_RESET}
@@ -955,6 +1162,9 @@ SUMMARY
 }
 
 main() {
+    # Before the log redirect, so --help and bad arguments work without root.
+    parse_args "$@"
+
     mkdir -p "$(dirname "$LOG_FILE")"
     exec > >(tee -a "$LOG_FILE") 2>&1
     printf '%s\n' "=== install-node.sh $(date -Is) ===" >> "$LOG_FILE"
@@ -963,20 +1173,20 @@ main() {
     gather_input
     validate_panel
     resolve_config_profile
-    beszel_login
-    setup_dns
+    beszel_login       || true
+    setup_dns          || true
     install_docker
-    tune_kernel
-    configure_ufw
-    await_dns
-    install_selfsteal
-    locate_certs
+    tune_kernel        || true
+    configure_ufw      || true
+    await_dns          || true
+    install_selfsteal  || true
+    locate_certs       || true
     install_remnanode
-    install_cert_watcher
+    install_cert_watcher || true
     register_node
-    install_warp
-    install_beszel
-    migrate_ssh
+    install_warp       || true
+    install_beszel     || true
+    migrate_ssh        || true
     summary
 }
 
