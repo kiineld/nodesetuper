@@ -1742,6 +1742,42 @@ install_zapret() {
     return 0
 }
 
+# blockcheck is zapret's own strategy finder. It must run with every bypass
+# stopped — its first check warns about this, and if nfqws is live its own
+# NFQUEUE redirection collides with the running rules and every nfqws test
+# fails with a timeout, which looks like "nothing works" after an hour or two.
+run_blockcheck() {
+    step "Find a working strategy (zapret blockcheck)"
+    if [[ ! -x "$ZAPRET_DIR/blockcheck.sh" ]]; then
+        soft_fail "$ZAPRET_DIR/blockcheck.sh not found — install zapret first (13)"
+        return 1
+    fi
+
+    local was_active=no
+    if systemctl is-active --quiet zapret 2>/dev/null; then
+        was_active=yes
+        info "stopping zapret so the results are not distorted"
+        systemctl stop zapret >/dev/null 2>&1 || true
+        sleep 2
+    fi
+
+    warn "this is slow: 'standard' mode tries well over a thousand combinations,"
+    warn "and every failing one burns its full timeout. Budget 1.5-2.5 hours."
+    warn "Choose 'quick' (1) at the scan-mode prompt to stop at the first hit —"
+    warn "usually minutes instead of hours."
+    echo
+
+    "$ZAPRET_DIR/blockcheck.sh" < /dev/tty || warn "blockcheck exited non-zero"
+
+    if [[ "$was_active" == "yes" ]]; then
+        info "restarting zapret"
+        systemctl start zapret >/dev/null 2>&1 || warn "could not restart zapret"
+    fi
+    info "put the winning options into NFQWS_OPT in $ZAPRET_DIR/config,"
+    info "then: systemctl restart zapret  — and re-check with menu option 14"
+    return 0
+}
+
 # --- Menu ------------------------------------------------------------------
 
 action_done() {
@@ -1781,6 +1817,7 @@ ${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLI
    ${C_YEL}optional${C_RESET}
    13)  Zapret (DPI bypass)       download + run zapret's own installer
    14)  DPI check (test 4)        TCP 16-20KB blocking, before/after zapret
+   15)  Find a strategy           zapret blockcheck, with zapret stopped first
 
     0)  Quit
 
@@ -1791,7 +1828,7 @@ menu() {
     local choice
     while :; do
         show_menu
-        prompt "choose [0-14]: "
+        prompt "choose [0-15]: "
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
@@ -1824,6 +1861,7 @@ menu() {
                 fi
                 action_done ;;
            14)  run_dpi_check manual || true; action_done ;;
+           15)  run_blockcheck || true; action_done ;;
             0|q|quit|exit) printf '
 '; return 0 ;;
             "") ;;
