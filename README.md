@@ -329,6 +329,37 @@ ENOENT. Menu option 18 groups them by tag; the raw view is:
 nft list chain inet rw_torrent_guard out
 ```
 
+### Tracker blocklist
+
+MSE encrypts the peer stream, and there is no signature left to match on an
+encrypted peer connection. nDPI's own netfilter port carries an open bug
+describing exactly that — *"some packets are identified and dropped, but most
+of them cannot be identified and torrent downloads continuously"* — so a DPI
+module would reproduce the problem rather than solve it.
+
+What encryption does not hide is that a client still has to ask a tracker where
+the peers are, and trackers live at known addresses. Sandvine's commercial gear
+attacks the same point for the same reason. With DHT and UDP trackers already
+blocked, removing HTTP and HTTPS trackers leaves an encrypted torrent with no
+way to find anybody.
+
+`rw-tracker-sync` resolves the public tracker list into an nftables set, on a
+daily timer. Menu option **21** refreshes it by hand; `skiptrackers=yes` skips
+it entirely.
+
+It is deliberately reluctant to write anything it cannot vouch for. A tracker
+behind a shared CDN resolves to an address serving thousands of unrelated
+sites, so those are dropped twice: by Cloudflare's published ranges, and by a
+shared-address heuristic — more than four tracker hostnames on one address means
+infrastructure, not a tracker — which catches every other CDN without needing to
+know its name. Non-global addresses go too, so a node with hijacked or filtered
+DNS cannot poison the set. If the list fetch fails, the Cloudflare fetch fails,
+or nothing survives filtering, it keeps the existing set rather than flushing to
+something it is unsure of.
+
+**This covers public trackers only.** A private tracker is not on the list and
+will not be blocked.
+
 ### Whitelist
 
 Both features read `/etc/rw-whitelist` — one IPv4 address or CIDR per line,

@@ -98,6 +98,9 @@ LOG_FILE="/var/log/remnanode-autoinstall.log"
 GUARD_NFT="/etc/rw-torrent-guard.nft"
 SHAPER_BIN="/usr/local/bin/rw-shaper"
 SHAPER_CONF="/etc/rw-shaper.conf"
+TRACKER_BIN="/usr/local/bin/rw-tracker-sync"
+TRACKER_LIST_URL="${TRACKER_LIST_URL:-https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt}"
+SKIP_TRACKERS="${SKIP_TRACKERS:-no}"
 WHITELIST_FILE="/etc/rw-whitelist"
 WHITELIST_BIN="/usr/local/bin/rw-whitelist-apply"
 
@@ -331,6 +334,7 @@ parse_args() {
             shapemaxclients)                            set_var SHAPE_MAX_CLIENTS "$val" ;;
             shapemaxconns)                              set_var SHAPE_MAX_CONNS "$val" ;;
             shapeignoreips|shapeignore)                 set_var SHAPE_IGNORE_IPS "$val" ;;
+            skiptrackers)                               set_var SKIP_TRACKERS "$val" ;;
             remove|uninstall)                           set_var REMOVE_WHAT "$val" ;;
             installdir)                                 set_var INSTALL_DIR "$val" ;;
             *) warn "unknown argument: ${arg%%=*}  (run with --help for the list)" ;;
@@ -1686,6 +1690,13 @@ table inet rw_torrent_guard {
         elements = { 6881-6889, 51413, 21413, 17417, 37305 }
     }
 
+    # Filled by rw-tracker-sync. Empty until it first runs, and left alone if
+    # a later refresh fails, so protection is never dropped by a bad fetch.
+    set trackers {
+        type ipv4_addr
+        flags interval
+    }
+
     # Filled from /etc/rw-whitelist by rw-whitelist-apply. Destinations only:
     # this chain sees the node's own outbound connections, where the client
     # who caused them is not represented in any packet field.
@@ -1719,6 +1730,11 @@ table inet rw_torrent_guard {
 
         udp dport 53 accept
         tcp dport 53 accept
+
+        # Public trackers. This is the rule that stops an encrypted download:
+        # MSE hides the peer stream but a client still has to ask a tracker
+        # where the peers are, and that request goes to a known address.
+        ip daddr @trackers counter drop comment "tracker"
 
         # UDP tracker connect: the 8-byte magic 0x41727101980 at the start of
         # the UDP payload. The UDP header is 8 bytes, so the payload begins at
@@ -1766,6 +1782,7 @@ GUARD
     fi
     ok "ruleset loaded"
     "$WHITELIST_BIN" 2>&1 | sed 's/^/       /' || true
+    install_tracker_blocklist || true
 
     cat > /etc/systemd/system/rw-torrent-guard.service <<'UNIT'
 [Unit]
@@ -2230,6 +2247,202 @@ SHAPER
     ok "daemon written to $SHAPER_BIN"
 }
 
+# --- Tracker blocklist ------------------------------------------------------
+# MSE encrypts the peer stream, so there is no signature left to match on a
+# peer connection — nDPI's own netfilter port has an open bug describing
+# exactly that failure. What encryption does not hide is that the client still
+# has to ask a tracker where the peers are, and trackers live at known
+# addresses. Blocking those, with DHT and UDP trackers already gone, leaves an
+# encrypted torrent with no way to find anybody.
+install_tracker_blocklist() {
+    step "Tracker blocklist"
+
+    if [[ "$SKIP_TRACKERS" == "yes" ]]; then
+        info "skipped (skiptrackers=yes)"
+        return 0
+    fi
+    if ! nft list set inet rw_torrent_guard trackers >/dev/null 2>&1; then
+        soft_fail "the torrent guard is not loaded — run option 16 first"
+        return 1
+    fi
+    if ! have python3; then
+        soft_fail "python3 is required for the tracker sync"
+        return 1
+    fi
+
+    cat > "$TRACKER_BIN" <<'PYEOF'
+#!/usr/bin/env python3
+"""Resolve public tracker hostnames into the torrent guard's nftables set.
+
+Refuses to write a list it cannot vouch for. A tracker sitting behind a shared
+CDN resolves to an address serving thousands of unrelated sites, and blocking
+that would take out far more than BitTorrent, so such addresses are dropped
+twice over: by Cloudflare's published ranges, and by a shared-address heuristic
+that catches every other CDN without needing to know its name.
+"""
+import collections
+import ipaddress
+import os
+import socket
+import subprocess
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+LIST_URL = os.environ.get("TRACKER_LIST_URL",
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt")
+CF_URL = "https://www.cloudflare.com/ips-v4"
+TABLE = ("inet", "rw_torrent_guard")
+SET = "trackers"
+# An address shared by more than this many tracker hostnames is infrastructure,
+# not a tracker.
+MAX_SHARED = int(os.environ.get("TRACKER_MAX_SHARED", "4"))
+
+
+def log(msg):
+    print("rw-tracker-sync: %s" % msg, flush=True)
+
+
+def fetch(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": "rw-tracker-sync"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def hostnames(raw):
+    out = set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or "://" not in line:
+            continue
+        hostport = line.split("://", 1)[1].split("/", 1)[0]
+        if hostport.startswith("["):          # bracketed IPv6
+            host = hostport.split("]", 1)[0].lstrip("[")
+        else:
+            host = hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+        if host:
+            out.add(host.lower())
+    return out
+
+
+def resolve(host):
+    try:
+        return host, {ai[4][0] for ai in socket.getaddrinfo(host, None, socket.AF_INET)}
+    except Exception:
+        return host, set()
+
+
+def main():
+    if subprocess.run(["nft", "list", "set", TABLE[0], TABLE[1], SET],
+                      capture_output=True).returncode != 0:
+        log("guard table is not loaded; nothing to do")
+        return 1
+
+    try:
+        hosts = hostnames(fetch(LIST_URL))
+    except Exception as exc:
+        log("could not fetch the tracker list (%s); keeping the current set" % exc)
+        return 1
+    if not hosts:
+        log("no hostnames parsed; keeping the current set")
+        return 1
+
+    # Mandatory. Without it we cannot tell a tracker from Cloudflare, and a
+    # stale set is very much better than a blackholed CDN.
+    try:
+        cf = [ipaddress.ip_network(l.strip()) for l in fetch(CF_URL, 30).splitlines()
+              if l.strip()]
+    except Exception as exc:
+        log("could not fetch Cloudflare ranges (%s); refusing to build a list" % exc)
+        return 1
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        resolved = list(pool.map(resolve, hosts))
+
+    owners = collections.defaultdict(set)
+    for host, ips in resolved:
+        for ip in ips:
+            owners[ip].add(host)
+
+    keep, shared, cdn, skipped = set(), 0, 0, 0
+    for ip, hs in owners.items():
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if not addr.is_global:
+            skipped += 1
+            continue
+        if len(hs) > MAX_SHARED:
+            shared += 1
+            continue
+        if any(addr in net for net in cf):
+            cdn += 1
+            continue
+        keep.add(ip)
+
+    log("%d hostnames -> %d addresses (%d shared, %d cloudflare, %d non-global dropped)"
+        % (len(hosts), len(keep), shared, cdn, skipped))
+    if not keep:
+        log("nothing survived filtering; keeping the current set")
+        return 1
+
+    subprocess.run(["nft", "flush", "set", TABLE[0], TABLE[1], SET], check=False)
+    ordered = sorted(keep)
+    for i in range(0, len(ordered), 500):
+        chunk = ordered[i:i + 500]
+        subprocess.run(
+            ["nft", "add", "element", TABLE[0], TABLE[1], SET,
+             "{ " + ", ".join(chunk) + " }"], check=False)
+    log("loaded %d addresses" % len(ordered))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYEOF
+    chmod 755 "$TRACKER_BIN"
+
+    cat > /etc/systemd/system/rw-tracker-sync.service <<'UNIT'
+[Unit]
+Description=Refresh the public tracker blocklist
+After=network-online.target rw-torrent-guard.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rw-tracker-sync
+UNIT
+
+    cat > /etc/systemd/system/rw-tracker-sync.timer <<'UNIT'
+[Unit]
+Description=Refresh the public tracker blocklist daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable rw-tracker-sync.timer >/dev/null 2>&1 || true
+    systemctl start rw-tracker-sync.timer >/dev/null 2>&1 || true
+
+    info "fetching the list — this takes a moment"
+    if TRACKER_LIST_URL="$TRACKER_LIST_URL" "$TRACKER_BIN" 2>&1 | sed 's/^/       /'; then
+        local n
+        n=$(nft -j list set inet rw_torrent_guard trackers 2>/dev/null \
+            | jq '[ .nftables[]? | .set? // empty | .elem[]? ] | length' 2>/dev/null)
+        ok "blocklist active with ${n:-0} addresses, refreshed daily"
+    else
+        soft_fail "the first sync did not complete — the timer will retry"
+        return 1
+    fi
+}
+
 # --- Removal ----------------------------------------------------------------
 # Stopping the service is what actually undoes the runtime state: the daemon
 # traps SIGTERM and tears down its own tc qdiscs and nftables table. Everything
@@ -2292,6 +2505,8 @@ remove_torrent_guard() {
         info "no rw-torrent-guard service was installed"
     fi
 
+    systemctl disable --now rw-tracker-sync.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/rw-tracker-sync.{service,timer} "$TRACKER_BIN"
     rm -f /etc/systemd/system/rw-torrent-guard.service "$GUARD_NFT"
     systemctl daemon-reload 2>/dev/null || true
     nft delete table inet rw_torrent_guard 2>/dev/null || true
@@ -2704,6 +2919,7 @@ ${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLI
    16)  Torrent guard              nftables: DHT, UDP trackers, BitTorrent ports
    17)  Speed shaper               >${SHAPE_TRIGGER_MBIT} Mbit/s for ${SHAPE_TRIGGER_SECONDS}s -> ${SHAPE_CAP_MBIT} Mbit/s
    18)  Guard status               counters, shaped clients, top talkers
+   21)  Refresh trackers           re-resolve the public tracker blocklist
    19)  Remove speed shaper        stop it, undo tc, delete its files
    20)  Remove torrent guard       stop it, drop the table, delete its files
 
@@ -2721,7 +2937,7 @@ menu() {
     local choice
     while :; do
         show_menu
-        prompt "choose [0-20]: "
+        prompt "choose [0-21]: "
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
@@ -2758,6 +2974,7 @@ menu() {
            16)  install_torrent_guard || true; action_done ;;
            17)  install_speed_shaper  || true; action_done ;;
            18)  guard_status || true; action_done ;;
+           21)  install_tracker_blocklist || true; action_done ;;
            19)  remove_speed_shaper || true; action_done ;;
            20)  remove_torrent_guard || true; action_done ;;
             0|q|quit|exit) printf '
