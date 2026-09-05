@@ -304,10 +304,13 @@ traffic routed into WARP, which crosses `output` before encapsulation. It drops:
 - **the classic port ranges** — 6881-6889, 51413, 21413, 17417, 37305, on the
   opening packet only, so nothing already running is cut off
 
-Replies to your own clients are accepted before any port rule is consulted.
-That matters: an ephemeral source port can legitimately land inside those
-ranges — 51413 sits inside the Windows ephemeral range 49152-65535 — and
-without that ordering a Windows client could have its return traffic dropped.
+Anything answering a connection somebody else opened to the node — client
+traffic, the panel, beszel, ssh — is accepted before any drop rule, via
+`ct direction reply` rather than a list of listening ports. That distinction
+matters: a port list has to grow every time you add an inbound, and the moment
+it overlaps the ephemeral range (Linux uses 32768-60999) it starts accepting
+the node's own outbound connections and every rule below it becomes
+unreachable. Matching on direction cannot drift that way.
 
 It drops silently and reports nothing to the panel, so a false positive costs
 one connection rather than locking a customer out. Because it only inspects the
@@ -329,6 +332,12 @@ client addresses with per-element byte counters, fed from both directions on the
 client-facing ports. `tc` does the enforcement: HTB on the WAN device for
 download, on an ifb for upload.
 
+The meter matches connection direction as well as port, which is what lets
+`shapeports=` carry a wide range safely. Metering `20000-50000` on port alone
+would also catch replies coming back from sites xray fetched, since the node's
+own ephemeral ports overlap that range — and those bytes would be filed against
+the remote server's address, which could eventually get it shaped.
+
 The trigger is the **combined** rate; the cap is 8 Mbit/s in **each** direction.
 Release is keyed on falling below 4 Mbit/s for 5 minutes rather than below the
 trigger — once shaped, a client that keeps pulling sits at the cap and could
@@ -341,7 +350,7 @@ never drop under 100 Mbit/s again.
 | cap | 8 Mbit/s | `shapecap=` |
 | release below | 4 Mbit/s | `shaperelease=` |
 | release after | 300 s | `shapereleasefor=` |
-| ports metered | 443 | `shapeports=` |
+| ports metered | 443, 1443, 8443, 8444, 20000-50000 | `shapeports=` |
 | shape upload too | yes | `shapeupload=` |
 | never shape | — | `shapeignore=` |
 

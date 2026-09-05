@@ -157,13 +157,12 @@ table inet rw_torrent_guard {
         udp dport 53 accept
         tcp dport 53 accept
 
-        # Replies to our own clients. Must come before the port rules: a client
-        # whose ephemeral source port happens to fall in @bt_ports would
-        # otherwise have its return traffic dropped. 51413 sits inside the
-        # Windows ephemeral range 49152-65535, so this is not hypothetical.
-        tcp sport 443 accept
-        udp sport 443 accept
-        # plus: accept to PANEL_IP, beszel hub, SSH peer
+        # Anything answering a connection opened to us — clients, panel,
+        # beszel, ssh. A connection-direction test rather than a port list:
+        # a port list has to widen as inbounds are added, and once it overlaps
+        # the ephemeral range (32768-60999) it accepts the node's own outbound
+        # connections and everything below becomes unreachable.
+        ct direction reply accept
 
         # UDP tracker connect: magic 0x41727101980, 8 bytes at UDP payload start
         meta l4proto udp @th,64,64 0x0000041727101980 counter name c_udp_tracker drop
@@ -196,8 +195,11 @@ covers the unencrypted case that a string match could catch.
 
 **Measure.** One nftables set of client addresses with per-element byte
 counters, fed from both directions on the WAN interface, restricted to the
-client-facing ports (443/tcp and 443/udp — the only ones `configure_ufw` opens
-to the world).
+client-facing ports and to the original/reply direction of connections clients
+opened. Direction is what makes a wide port range safe: metering
+`20000-50000` on port alone also catches replies from sites xray fetched, since
+the node's ephemeral ports overlap it, filing those bytes against the remote
+server's address.
 
 ```
 table inet rw_shaper {
@@ -210,13 +212,13 @@ table inet rw_shaper {
     }
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
-        iifname $WAN tcp dport 443 update @clients { ip saddr }
-        iifname $WAN udp dport 443 update @clients { ip saddr }
+        iifname $WAN ct direction original tcp dport { $PORTS } update @clients { ip saddr }
+        iifname $WAN ct direction original udp dport { $PORTS } update @clients { ip saddr }
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
-        oifname $WAN tcp sport 443 update @clients { ip daddr }
-        oifname $WAN udp sport 443 update @clients { ip daddr }
+        oifname $WAN ct direction reply tcp sport { $PORTS } update @clients { ip daddr }
+        oifname $WAN ct direction reply udp sport { $PORTS } update @clients { ip daddr }
     }
 }
 ```

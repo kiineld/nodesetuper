@@ -65,9 +65,10 @@ SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
 SKIP_TORRENT_GUARD="${SKIP_TORRENT_GUARD:-no}"
 SKIP_SHAPER="${SKIP_SHAPER:-no}"        # set yes on CDN-fronted nodes
 
-# Ports xray exposes to clients. Everything else on the wire — panel, beszel,
-# ssh — is deliberately not measured. configure_ufw opens exactly these.
-SHAPE_PORTS="${SHAPE_PORTS:-443}"
+# Ports xray exposes to clients. Ranges are fine: the meter also matches on
+# connection direction, so a range overlapping the ephemeral ports (Linux uses
+# 32768-60999) still cannot pick up replies to connections the node itself made.
+SHAPE_PORTS="${SHAPE_PORTS:-443,1443,8443,8444,20000-50000}"
 SHAPE_TRIGGER_MBIT="${SHAPE_TRIGGER_MBIT:-100}"  # sustained rate that trips it
 SHAPE_TRIGGER_SECONDS="${SHAPE_TRIGGER_SECONDS:-120}"
 SHAPE_CAP_MBIT="${SHAPE_CAP_MBIT:-8}"            # what an offender is held to
@@ -1605,12 +1606,6 @@ install_torrent_guard() {
         return 1
     fi
 
-    # Ports we must never mistake for torrent traffic. A client's ephemeral
-    # source port can legitimately land inside the BitTorrent ranges — 51413
-    # sits inside the Windows ephemeral range 49152-65535 — so replies to our
-    # own clients are accepted before any port rule is consulted.
-    local svc_ports="${SHAPE_PORTS},${NODE_PORT},${SSH_PORT},${BESZEL_PORT},${SELFSTEAL_PORT},${FALLBACK_PORT}"
-
     # No `table` + `delete table` prelude here. Deleting and recreating the
     # table inside one batch stops nft resolving the named counters and the
     # @bt_ports set that the same batch is creating — every rule that
@@ -1637,13 +1632,20 @@ table inet rw_torrent_guard {
         type filter hook output priority 10; policy accept;
 
         oifname "lo" accept
+
+        # Anything answering a connection somebody else opened to us: client
+        # traffic, the panel, beszel, ssh. Never something this node started,
+        # so never torrent traffic leaving the box.
+        #
+        # This is a connection-direction test rather than a list of listening
+        # ports on purpose. A port list has to widen as inbounds are added, and
+        # once it overlaps the ephemeral range (Linux 32768-60999) it starts
+        # accepting the node's own outbound connections and every rule below
+        # becomes unreachable.
+        ct direction reply accept
+
         udp dport 53 accept
         tcp dport 53 accept
-
-        # Replies to our own clients and to the control plane. Must precede
-        # the port rules — see the note above about ephemeral source ports.
-        tcp sport { ${svc_ports} } accept
-        udp sport { ${svc_ports} } accept
 
         # UDP tracker connect: the 8-byte magic 0x41727101980 at the start of
         # the UDP payload. The UDP header is 8 bytes, so the payload begins at
@@ -1886,15 +1888,21 @@ table inet $TABLE {
         timeout 10m
         counter
     }
+    # ct direction is what keeps a wide PORTS range honest. Without it,
+    # "dport 20000-50000" inbound also matches replies coming back from sites
+    # xray fetched, since the node's own ephemeral ports (32768-60999) overlap
+    # that range — and the bytes would be filed against the remote server's
+    # address, which could end up shaped. Priority -150 runs after conntrack
+    # at -200, so the direction is known by the time these rules see a packet.
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
-        iifname "$WAN" tcp dport { $PORTS } update @clients { ip saddr }
-        iifname "$WAN" udp dport { $PORTS } update @clients { ip saddr }
+        iifname "$WAN" ct direction original tcp dport { $PORTS } update @clients { ip saddr }
+        iifname "$WAN" ct direction original udp dport { $PORTS } update @clients { ip saddr }
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
-        oifname "$WAN" tcp sport { $PORTS } update @clients { ip daddr }
-        oifname "$WAN" udp sport { $PORTS } update @clients { ip daddr }
+        oifname "$WAN" ct direction reply tcp sport { $PORTS } update @clients { ip daddr }
+        oifname "$WAN" ct direction reply udp sport { $PORTS } update @clients { ip daddr }
     }
 }
 NFT
