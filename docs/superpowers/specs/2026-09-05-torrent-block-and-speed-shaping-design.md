@@ -314,6 +314,13 @@ assumed:
    address maintained by explicit rules, or `conntrack -L` accounting.
 2. **Raw payload offsets.** Confirm `@th,64,64` matches the intended bytes for
    UDP on the target kernel, by generating a DHT query and watching the counter.
+   Note that `nft -c -f` is not the tool for this. Check mode cannot resolve
+   named counters or sets that the same batch is creating, and a
+   `table` + `delete table` prelude breaks that resolution even outside check
+   mode — every referencing rule fails with ENOENT. Confirmed on Ubuntu 24.04,
+   kernel 6.1.182, nft 1.0.9. The table is deleted imperatively beforehand and
+   the file is loaded for real; nftables applies a file as one atomic
+   transaction, so a failed load commits nothing.
 3. **Coexistence.** Confirm the two new tables do not disturb ufw, Docker's
    chains, or the plugin's table: `nft list ruleset` before and after, plus a
    connectivity check from a client.

@@ -1611,14 +1611,16 @@ install_torrent_guard() {
     # own clients are accepted before any port rule is consulted.
     local svc_ports="${SHAPE_PORTS},${NODE_PORT},${SSH_PORT},${BESZEL_PORT},${SELFSTEAL_PORT},${FALLBACK_PORT}"
 
+    # No `table` + `delete table` prelude here. Deleting and recreating the
+    # table inside one batch stops nft resolving the named counters and the
+    # @bt_ports set that the same batch is creating — every rule that
+    # references one fails with ENOENT. The service and the installer both
+    # delete the table beforehand instead.
     cat > "$GUARD_NFT" <<GUARD
 #!/usr/sbin/nft -f
 # Written by install-node.sh. Reloaded by rw-torrent-guard.service.
 # Blocks what Xray cannot see: DHT, UDP trackers, and the classic BitTorrent
 # port ranges — on traffic this node sends out.
-
-table inet rw_torrent_guard
-delete table inet rw_torrent_guard
 
 table inet rw_torrent_guard {
     set bt_ports {
@@ -1663,11 +1665,19 @@ table inet rw_torrent_guard {
 GUARD
     chmod 644 "$GUARD_NFT"
 
-    if ! nft -c -f "$GUARD_NFT" 2>/tmp/rwguard.err; then
-        soft_fail "the ruleset did not validate: $(tr -d '\n' </tmp/rwguard.err)"
+    # nftables applies a file as one atomic transaction: if any rule in it
+    # fails, nothing is committed. Loading it for real is therefore as safe as
+    # a dry run, and it avoids `nft -c`, which cannot resolve named objects the
+    # same batch is creating.
+    nft delete table inet rw_torrent_guard 2>/dev/null || true
+    if ! nft -f "$GUARD_NFT" 2>/tmp/rwguard.err; then
+        soft_fail "the ruleset did not load"
+        sed 's/^/       /' /tmp/rwguard.err | head -20
         info "kernel $(uname -r), nft $(nft --version 2>/dev/null | head -1)"
+        nft delete table inet rw_torrent_guard 2>/dev/null || true
         return 1
     fi
+    ok "ruleset loaded"
 
     cat > /etc/systemd/system/rw-torrent-guard.service <<'UNIT'
 [Unit]
@@ -1678,7 +1688,11 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# The file creates the table outright, so anything left over from a previous
+# run has to go first — adding a table that already exists is an error.
+ExecStartPre=-/usr/sbin/nft delete table inet rw_torrent_guard
 ExecStart=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
+ExecReload=-/usr/sbin/nft delete table inet rw_torrent_guard
 ExecReload=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
 ExecStop=-/usr/sbin/nft delete table inet rw_torrent_guard
 
