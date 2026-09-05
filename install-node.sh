@@ -1705,7 +1705,11 @@ WantedBy=multi-user.target
 UNIT
 
     systemctl daemon-reload
-    if systemctl enable --now rw-torrent-guard.service >/dev/null 2>&1; then
+    # enable --now does nothing to a service that is already active, so a
+    # re-run would leave the previous ruleset in place and silently report
+    # success. Enable and restart are separate steps for that reason.
+    systemctl enable rw-torrent-guard.service >/dev/null 2>&1 || true
+    if systemctl restart rw-torrent-guard.service >/dev/null 2>&1; then
         ok "loaded and enabled at boot"
     else
         soft_fail "could not start rw-torrent-guard.service"
@@ -1800,7 +1804,11 @@ WantedBy=multi-user.target
 UNIT
 
     systemctl daemon-reload
-    if systemctl enable --now rw-shaper.service >/dev/null 2>&1; then
+    # Same trap as the guard: enable --now leaves an already-running daemon
+    # alone, so it would keep metering whatever ports it was started with
+    # while the config on disk said something else entirely.
+    systemctl enable rw-shaper.service >/dev/null 2>&1 || true
+    if systemctl restart rw-shaper.service >/dev/null 2>&1; then
         ok "running and enabled at boot"
     else
         soft_fail "could not start rw-shaper.service"
