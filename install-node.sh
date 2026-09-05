@@ -2113,19 +2113,33 @@ guard_status() {
     fi
 
     # Two samples two seconds apart turns the running byte counters into rates.
+    # Mind the spaces around `//` here: jq lexes `?//` as the destructuring
+    # alternative operator, so `.set?//empty` is a syntax error.
     if nft list set inet rw_shaper clients >/dev/null 2>&1; then
-        local a b
-        a=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c '[.nftables[]?|.set?//empty|.elem[]?|(.elem//.)|select(.counter!=null)|{(.val|tostring):.counter.bytes}]|add // {}')
+        local a b snap
+        snap='[ .nftables[]? | .set? // empty | .elem[]? | (.elem // .)
+                | select(type == "object") | select(.counter != null)
+                | { (.val | tostring): .counter.bytes } ] | add // {}'
+        a=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c "$snap" 2>/dev/null)
         sleep 2
-        b=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c '[.nftables[]?|.set?//empty|.elem[]?|(.elem//.)|select(.counter!=null)|{(.val|tostring):.counter.bytes}]|add // {}')
+        b=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c "$snap" 2>/dev/null)
+        [[ -z "$a" ]] && a='{}'
+        [[ -z "$b" ]] && b='{}'
+
         printf '\n     top clients by current throughput\n'
-        jq -rn --argjson a "$a" --argjson b "$b" '
+        local rows
+        rows=$(jq -rn --argjson a "$a" --argjson b "$b" '
             [ $b | to_entries[]
               | select($a[.key] != null and .value >= $a[.key])
-              | {ip: .key, mbit: (((.value - $a[.key]) * 8 / 2 / 1000000) * 10 | round / 10)} ]
+              | { ip: .key,
+                  mbit: ((.value - $a[.key]) * 8 / 2 / 1000000 * 10 | round / 10) } ]
             | sort_by(-.mbit) | .[:10] | .[]
-            | "       \(.ip)  \(.mbit) Mbit/s"' 2>/dev/null \
-            || info "no samples yet"
+            | "       \(.ip)  \(.mbit) Mbit/s"' 2>/dev/null)
+        if [[ -n "$rows" ]]; then
+            printf '%s\n' "$rows"
+        else
+            info "no client traffic on ports ${SHAPE_PORTS} during the sample"
+        fi
     fi
 }
 
