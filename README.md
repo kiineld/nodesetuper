@@ -329,6 +329,31 @@ ENOENT. Menu option 18 groups them by tag; the raw view is:
 nft list chain inet rw_torrent_guard out
 ```
 
+### Whitelist
+
+Both features read `/etc/rw-whitelist` — one IPv4 address or CIDR per line,
+`#` comments allowed. Edit it and apply without reinstalling anything:
+
+```bash
+rw-whitelist-apply
+```
+
+It loads the file into an nftables set in whichever of the two tables are
+present, and reports what each accepted. The file is created once and preserved
+across re-runs, so edits survive an upgrade.
+
+**Speed shaper:** whitelisted clients are skipped before the meter, so they are
+never measured and therefore never shaped. This works exactly as you would
+expect.
+
+**Torrent guard:** the whitelist exempts *destinations*, not clients. It cannot
+be otherwise. The guard sits on the node's `output` hook, where it sees
+connections xray made on somebody's behalf — source address is the node itself
+and source port is ephemeral. Which subscriber caused a given packet is not
+represented in any field, so there is nothing to match a client whitelist
+against. Only Xray knows that, which is why per-user exemptions live in the
+Remnawave plugin's own `ignoreLists.ip` / `ignoreLists.userId` instead.
+
 ### Speed shaper (17)
 
 A client sustaining more than 100 Mbit/s for longer than 2 minutes is held to

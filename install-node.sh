@@ -97,6 +97,8 @@ LOG_FILE="/var/log/remnanode-autoinstall.log"
 GUARD_NFT="/etc/rw-torrent-guard.nft"
 SHAPER_BIN="/usr/local/bin/rw-shaper"
 SHAPER_CONF="/etc/rw-shaper.conf"
+WHITELIST_FILE="/etc/rw-whitelist"
+WHITELIST_BIN="/usr/local/bin/rw-whitelist-apply"
 
 # ---------------------------------------------------------------------------
 # Plumbing
@@ -1586,6 +1588,61 @@ summary() {
 SUMMARY
 }
 
+# --- Whitelist --------------------------------------------------------------
+# One file both features read. Written once and preserved across re-runs, so
+# edits survive an upgrade.
+install_whitelist() {
+    if [[ ! -e "$WHITELIST_FILE" ]]; then
+        cat > "$WHITELIST_FILE" <<'WL'
+# Addresses exempt from the speed shaper and the torrent guard.
+# One IPv4 address or CIDR per line. Blank lines and # comments are ignored.
+#
+#   203.0.113.7
+#   198.51.100.0/24
+#
+# Speed shaper: these clients are never measured, so they are never shaped.
+# Torrent guard: traffic to these DESTINATIONS is never dropped. It cannot
+# exempt a client — see the note in the README about why.
+#
+# Apply changes without a full reinstall:
+#   rw-whitelist-apply
+WL
+        chmod 644 "$WHITELIST_FILE"
+    fi
+
+    # Kept separate from the ruleset files so editing the whitelist does not
+    # mean regenerating and reloading a whole table.
+    cat > "$WHITELIST_BIN" <<'APPLY'
+#!/usr/bin/env bash
+# Load /etc/rw-whitelist into whichever of the two tables are present.
+set -uo pipefail
+FILE=/etc/rw-whitelist
+applied=0
+
+for table in rw_torrent_guard rw_shaper; do
+    nft list set inet "$table" whitelist >/dev/null 2>&1 || continue
+    nft flush set inet "$table" whitelist 2>/dev/null
+    n=0
+    while read -r line; do
+        line="${line%%#*}"
+        line="${line//[[:space:]]/}"
+        [[ -z $line ]] && continue
+        if nft add element inet "$table" whitelist "{ $line }" 2>/dev/null; then
+            n=$((n + 1))
+        else
+            printf 'rw-whitelist-apply: %s rejected %s\n' "$table" "$line" >&2
+        fi
+    done < <(cat "$FILE" 2>/dev/null)
+    printf 'rw-whitelist-apply: %s <- %s entries\n' "$table" "$n"
+    applied=$((applied + 1))
+done
+
+(( applied > 0 )) || { printf 'rw-whitelist-apply: neither table is loaded\n' >&2; exit 1; }
+APPLY
+    chmod 755 "$WHITELIST_BIN"
+    ok "whitelist at $WHITELIST_FILE  (apply with: rw-whitelist-apply)"
+}
+
 # --- Torrent guard ---------------------------------------------------------
 # Xray's sniffer only recognises unencrypted BitTorrent, so a client with
 # protocol encryption switched on walks straight past the panel's routing
@@ -1606,6 +1663,8 @@ install_torrent_guard() {
         return 1
     fi
 
+    install_whitelist
+
     # No `table` + `delete table` prelude here. Deleting and recreating the
     # table inside one batch stops nft resolving the named counters and the
     # @bt_ports set that the same batch is creating — every rule that
@@ -1624,6 +1683,14 @@ table inet rw_torrent_guard {
         elements = { 6881-6889, 51413, 21413, 17417, 37305 }
     }
 
+    # Filled from /etc/rw-whitelist by rw-whitelist-apply. Destinations only:
+    # this chain sees the node's own outbound connections, where the client
+    # who caused them is not represented in any packet field.
+    set whitelist {
+        type ipv4_addr
+        flags interval
+    }
+
     # Anonymous counters, tagged with comments rather than declared as named
     # objects. A rule cannot reference a named counter created in the same
     # transaction — nft looks stateful objects up in the committed generation,
@@ -1634,6 +1701,7 @@ table inet rw_torrent_guard {
         type filter hook output priority 10; policy accept;
 
         oifname "lo" accept
+        ip daddr @whitelist counter accept comment "whitelist"
 
         # Anything answering a connection somebody else opened to us: client
         # traffic, the panel, beszel, ssh. Never something this node started,
@@ -1694,6 +1762,7 @@ GUARD
         return 1
     fi
     ok "ruleset loaded"
+    "$WHITELIST_BIN" 2>&1 | sed 's/^/       /' || true
 
     cat > /etc/systemd/system/rw-torrent-guard.service <<'UNIT'
 [Unit]
@@ -1708,8 +1777,10 @@ RemainAfterExit=yes
 # run has to go first — adding a table that already exists is an error.
 ExecStartPre=-/usr/sbin/nft delete table inet rw_torrent_guard
 ExecStart=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
+ExecStartPost=-/usr/local/bin/rw-whitelist-apply
 ExecReload=-/usr/sbin/nft delete table inet rw_torrent_guard
 ExecReload=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
+ExecReload=-/usr/local/bin/rw-whitelist-apply
 ExecStop=-/usr/sbin/nft delete table inet rw_torrent_guard
 
 [Install]
@@ -1823,6 +1894,7 @@ IGNORE_IPS="$(printf '%s' "$ignore" | tr ',' ' ' | xargs 2>/dev/null || true)"
 CONF
     chmod 600 "$SHAPER_CONF"
 
+    install_whitelist
     materialise_shaper_daemon || return 1
 
     cat > /etc/systemd/system/rw-shaper.service <<'UNIT'
@@ -1945,13 +2017,19 @@ table inet $TABLE {
     # that range — and the bytes would be filed against the remote server's
     # address, which could end up shaped. Priority -150 runs after conntrack
     # at -200, so the direction is known by the time these rules see a packet.
+    set whitelist {
+        type ipv4_addr
+        flags interval
+    }
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
+        iifname "$WAN" ip saddr @whitelist return
         iifname "$WAN" ct direction original tcp dport { $PORTS } counter update @clients { ip saddr counter } comment "meter-in"
         iifname "$WAN" ct direction original udp dport { $PORTS } counter update @clients { ip saddr counter } comment "meter-in"
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
+        oifname "$WAN" ip daddr @whitelist return
         oifname "$WAN" ct direction reply tcp sport { $PORTS } counter update @clients { ip daddr counter } comment "meter-out"
         oifname "$WAN" ct direction reply udp sport { $PORTS } counter update @clients { ip daddr counter } comment "meter-out"
     }
@@ -2073,6 +2151,11 @@ teardown() {
 trap teardown INT TERM
 
 nft_setup || { log "could not install the accounting table"; exit 1; }
+# The set exists but is empty until this runs; a whitelisted client would
+# otherwise be metered until the next restart.
+if [[ -x /usr/local/bin/rw-whitelist-apply ]]; then
+    /usr/local/bin/rw-whitelist-apply 2>&1 | while read -r l; do log "$l"; done
+fi
 tc_setup  || { log "could not set up tc"; exit 1; }
 log "watching $WAN ports $PORTS — trigger ${TRIGGER_MBIT}mbit for ${TRIGGER_SECONDS}s, cap ${CAP_MBIT}mbit, release below ${RELEASE_MBIT}mbit for ${RELEASE_SECONDS}s"
 
