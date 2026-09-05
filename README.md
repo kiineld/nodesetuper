@@ -329,6 +329,36 @@ ENOENT. Menu option 18 groups them by tag; the raw view is:
 nft list chain inet rw_torrent_guard out
 ```
 
+### Per-client ban
+
+One logged torrent connection bans that client outright — every connection from
+the address is refused until the ban expires. Default 600 seconds; set with
+`banseconds=`, disable with `skipban=yes`.
+
+The attribution comes from Xray's access log, not from packets. On the output
+hook the source address is the node itself and the source port is ephemeral, so
+a dropped packet cannot be traced to anyone. Xray writes the pairing:
+
+```
+2023/11/22 17:01:32 1.2.3.4:11421 accepted tcp:tracker.example:6969 [VLESS >> DIRECT] email: 5.bob
+```
+
+`rw-torrent-ban` tails those logs and bans the source on the first line whose
+destination is a known tracker hostname, whose port is a BitTorrent port, or
+whose outbound tag contains TORRENT. The address goes into an nftables set with
+a timeout, so bans expire without anything having to clean up after them.
+
+**This needs Xray to be writing an access log** to `/var/log/remnanode/`, which
+the node already mounts. With no access log there is nothing to attribute and
+the daemon says so on startup.
+
+**Exemptions matter more here than anywhere else.** A ban cuts every connection
+from an address, and on an exit node the addresses in the access log are your
+own entry nodes — banning one would disconnect every user behind it. The
+installer reads the node list from the panel and exempts them all; with no panel
+credentials it warns instead of guessing. `/etc/rw-whitelist` is honoured too,
+and private addresses are never banned.
+
 ### Tracker blocklist
 
 MSE encrypts the peer stream, and there is no signature left to match on an

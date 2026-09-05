@@ -98,6 +98,11 @@ LOG_FILE="/var/log/remnanode-autoinstall.log"
 GUARD_NFT="/etc/rw-torrent-guard.nft"
 SHAPER_BIN="/usr/local/bin/rw-shaper"
 SHAPER_CONF="/etc/rw-shaper.conf"
+BAN_BIN="/usr/local/bin/rw-torrent-ban"
+BAN_CONF="/etc/rw-torrent-ban.conf"
+BAN_SECONDS="${BAN_SECONDS:-600}"
+XRAY_LOG_GLOB="${XRAY_LOG_GLOB:-/var/log/remnanode/*.log}"
+SKIP_BAN="${SKIP_BAN:-no}"
 TRACKER_BIN="/usr/local/bin/rw-tracker-sync"
 TRACKER_LIST_URL="${TRACKER_LIST_URL:-https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt}"
 SKIP_TRACKERS="${SKIP_TRACKERS:-no}"
@@ -334,6 +339,8 @@ parse_args() {
             shapemaxclients)                            set_var SHAPE_MAX_CLIENTS "$val" ;;
             shapemaxconns)                              set_var SHAPE_MAX_CONNS "$val" ;;
             shapeignoreips|shapeignore)                 set_var SHAPE_IGNORE_IPS "$val" ;;
+            skipban)                                    set_var SKIP_BAN "$val" ;;
+            banseconds)                                 set_var BAN_SECONDS "$val" ;;
             skiptrackers)                               set_var SKIP_TRACKERS "$val" ;;
             remove|uninstall)                           set_var REMOVE_WHAT "$val" ;;
             installdir)                                 set_var INSTALL_DIR "$val" ;;
@@ -1690,6 +1697,14 @@ table inet rw_torrent_guard {
         elements = { 6881-6889, 51413, 21413, 17417, 37305 }
     }
 
+    # Filled by rw-torrent-ban, which reads the identity of the offender out
+    # of Xray's access log — the only place on this box where a packet can be
+    # tied back to a subscriber. Elements expire on their own.
+    set banned {
+        type ipv4_addr
+        flags timeout
+    }
+
     # Filled by rw-tracker-sync. Empty until it first runs, and left alone if
     # a later refresh fails, so protection is never dropped by a bad fetch.
     set trackers {
@@ -1711,6 +1726,14 @@ table inet rw_torrent_guard {
     # so every such rule fails with ENOENT. Anonymous counters belong to the
     # rule itself, so one atomic load stays possible; guard_status groups them
     # by comment to report the same three totals.
+    # Ahead of the shaper's meter at -150, so a banned client is not accounted
+    # for while it is being refused.
+    chain banned_in {
+        type filter hook prerouting priority -190; policy accept;
+        ip saddr @whitelist accept
+        ip saddr @banned counter drop comment "banned"
+    }
+
     chain out {
         type filter hook output priority 10; policy accept;
 
@@ -1783,6 +1806,7 @@ GUARD
     ok "ruleset loaded"
     "$WHITELIST_BIN" 2>&1 | sed 's/^/       /' || true
     install_tracker_blocklist || true
+    install_torrent_ban || true
 
     cat > /etc/systemd/system/rw-torrent-guard.service <<'UNIT'
 [Unit]
@@ -2395,6 +2419,15 @@ def main():
             ["nft", "add", "element", TABLE[0], TABLE[1], SET,
              "{ " + ", ".join(chunk) + " }"], check=False)
     log("loaded %d addresses" % len(ordered))
+
+    # The ban daemon matches log lines by hostname, since that is what Xray
+    # writes; it cannot reuse the address set.
+    try:
+        os.makedirs("/var/lib/rw-tracker-sync", exist_ok=True)
+        with open("/var/lib/rw-tracker-sync/hosts.txt", "w") as fh:
+            fh.write("\n".join(sorted(hosts)) + "\n")
+    except OSError as exc:
+        log("could not write the hostname list for rw-torrent-ban (%s)" % exc)
     return 0
 
 
@@ -2440,6 +2473,235 @@ UNIT
     else
         soft_fail "the first sync did not complete — the timer will retry"
         return 1
+    fi
+}
+
+# --- Torrent ban ------------------------------------------------------------
+# The guard drops torrent packets but cannot say who sent them: on the output
+# hook the source is this node and the source port is ephemeral. Xray's access
+# log is the one place that pairs a client address with the destination it
+# asked for, so the ban is driven from there rather than from the packets.
+install_torrent_ban() {
+    step "Torrent ban (per-client, ${BAN_SECONDS}s)"
+
+    if [[ "$SKIP_BAN" == "yes" ]]; then
+        info "skipped (skipban=yes)"
+        return 0
+    fi
+    if ! nft list set inet rw_torrent_guard banned >/dev/null 2>&1; then
+        soft_fail "the torrent guard is not loaded — run option 16 first"
+        return 1
+    fi
+    have python3 || { soft_fail "python3 is required"; return 1; }
+
+    # Banning an address here cuts every connection from it. If this node is an
+    # exit in a chain, the addresses in its access log are the entry nodes, and
+    # banning one would disconnect every user behind it at once.
+    local ignore="$SHAPE_IGNORE_IPS"
+    [[ -n "$PANEL_IP" ]] && ignore="$ignore $PANEL_IP"
+    [[ -n "${SSH_CLIENT:-}" ]] && ignore="$ignore ${SSH_CLIENT%% *}"
+    if [[ -n "$PANEL_URL" && -n "$REMNA_TOKEN" ]] && rw_api GET /api/nodes && rw_ok; then
+        local addr ip
+        while read -r addr; do
+            [[ -z "$addr" ]] && continue
+            if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                ignore="$ignore $addr"
+            else
+                ip=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+                [[ -n "$ip" ]] && ignore="$ignore $ip"
+            fi
+        done < <(printf '%s' "$RW_BODY" | jq -r '.response[]?.address // empty' 2>/dev/null)
+        ok "peer nodes exempted from banning"
+    else
+        warn "no panel credentials — peer nodes are NOT exempt"
+        info "on a chained node, pass shapeignore=<entry node IPs> before enabling this"
+    fi
+
+    cat > "$BAN_CONF" <<CONF
+# Written by install-node.sh
+BAN_SECONDS=${BAN_SECONDS}
+LOG_GLOB=${XRAY_LOG_GLOB}
+BT_PORTS=6881,6882,6883,6884,6885,6886,6887,6888,6889,51413,21413,17417,37305
+IGNORE_IPS=${ignore}
+CONF
+    chmod 600 "$BAN_CONF"
+
+    cat > "$BAN_BIN" <<'PYEOF'
+#!/usr/bin/env python3
+"""Ban clients whose traffic Xray logged as torrent activity.
+
+Reads Xray's access log, which is the only place on the node that pairs a
+client address with the destination it asked for. A packet on the output hook
+carries neither. One matching line is enough: the address goes into an
+nftables set with a timeout and every connection from it is refused until the
+element expires.
+"""
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONF = "/etc/rw-torrent-ban.conf"
+WHITELIST = "/etc/rw-whitelist"
+HOSTS = "/var/lib/rw-tracker-sync/hosts.txt"
+TABLE = ("inet", "rw_torrent_guard")
+
+# 2023/11/22 17:01:32 1.2.3.4:11421 accepted tcp:tracker.example:6969 [in >> out]
+LINE = re.compile(
+    r"(?P<src>\d{1,3}(?:\.\d{1,3}){3}):\d+\s+accepted\s+"
+    r"(?:(?P<proto>tcp|udp):)?(?P<dst>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)"
+    r"(?:\s+\[(?P<tags>[^\]]*)\])?")
+
+
+def log(msg):
+    print("rw-torrent-ban: %s" % msg, flush=True)
+
+
+def load_conf():
+    cfg = {}
+    try:
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except OSError as exc:
+        log("cannot read %s (%s)" % (CONF, exc))
+    return cfg
+
+
+def load_ignores(cfg):
+    out = set(cfg.get("IGNORE_IPS", "").split())
+    try:
+        with open(WHITELIST) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    out.add(line)
+    except OSError:
+        pass
+    return out
+
+
+def load_hosts():
+    try:
+        with open(HOSTS) as fh:
+            return {l.strip().lower() for l in fh if l.strip()}
+    except OSError:
+        return set()
+
+
+def main():
+    cfg = load_conf()
+    seconds = int(cfg.get("BAN_SECONDS", "600"))
+    glob = cfg.get("LOG_GLOB", "/var/log/remnanode/*.log")
+    bt_ports = {p for p in cfg.get("BT_PORTS", "").split(",") if p}
+    ignores = load_ignores(cfg)
+    hosts = load_hosts()
+    hosts_stamp = 0.0
+    log("watching %s — ban %ds, %d tracker hostnames, %d exempt addresses"
+        % (glob, seconds, len(hosts), len(ignores)))
+
+    banned_until = {}
+
+    def exempt(ip):
+        if ip in ignores:
+            return True
+        try:
+            return not ipaddress.ip_address(ip).is_global
+        except ValueError:
+            return True
+
+    def ban(ip, why):
+        now = time.time()
+        if banned_until.get(ip, 0) > now:
+            return
+        r = subprocess.run(
+            ["nft", "add", "element", TABLE[0], TABLE[1], "banned",
+             "{ %s timeout %ds }" % (ip, seconds)],
+            capture_output=True)
+        if r.returncode == 0:
+            banned_until[ip] = now + seconds
+            log("banned %s for %ds (%s)" % (ip, seconds, why))
+        else:
+            log("could not ban %s: %s" % (ip, r.stderr.decode().strip()))
+
+    # tail -F rides out log rotation, which copytruncate makes frequent here.
+    tail = subprocess.Popen("exec tail -F -n0 %s 2>/dev/null" % glob,
+                            shell=True, stdout=subprocess.PIPE)
+    for raw in tail.stdout:
+        line = raw.decode("utf-8", "replace")
+        m = LINE.search(line)
+        if not m:
+            continue
+
+        # Refreshed in place so a tracker sync takes effect without a restart.
+        if time.time() - hosts_stamp > 300:
+            hosts_stamp = time.time()
+            fresh = load_hosts()
+            if fresh:
+                hosts = fresh
+
+        src, dst, port = m.group("src"), m.group("dst").lower().strip("[]"), m.group("port")
+        tags = (m.group("tags") or "").upper()
+
+        why = None
+        if "TORRENT" in tags:
+            why = "routed to %s" % tags
+        elif dst in hosts:
+            why = "tracker %s" % dst
+        elif port in bt_ports:
+            why = "port %s" % port
+        if not why:
+            continue
+        if exempt(src):
+            continue
+        ban(src, why)
+
+    log("tail exited")
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+PYEOF
+    chmod 755 "$BAN_BIN"
+
+    cat > /etc/systemd/system/rw-torrent-ban.service <<'UNIT'
+[Unit]
+Description=Ban clients Xray logged as torrenting
+After=network-online.target rw-torrent-guard.service
+Wants=rw-torrent-guard.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rw-torrent-ban
+Restart=always
+RestartSec=10
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable rw-torrent-ban.service >/dev/null 2>&1 || true
+    if systemctl restart rw-torrent-ban.service >/dev/null 2>&1; then
+        ok "running — one logged torrent connection bans that client for ${BAN_SECONDS}s"
+    else
+        soft_fail "the ban service did not start — journalctl -u rw-torrent-ban"
+        return 1
+    fi
+
+    local found
+    found=$(compgen -G "$XRAY_LOG_GLOB" 2>/dev/null | head -1)
+    if [[ -z "$found" ]]; then
+        warn "no log files match $XRAY_LOG_GLOB yet"
+        info "Xray must be writing an access log there or nothing can be attributed"
+    else
+        ok "reading $(compgen -G "$XRAY_LOG_GLOB" | wc -l | tr -d ' ') log file(s)"
     fi
 }
 
@@ -2505,6 +2767,8 @@ remove_torrent_guard() {
         info "no rw-torrent-guard service was installed"
     fi
 
+    systemctl disable --now rw-torrent-ban.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/rw-torrent-ban.service "$BAN_BIN" "$BAN_CONF"
     systemctl disable --now rw-tracker-sync.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/rw-tracker-sync.{service,timer} "$TRACKER_BIN"
     rm -f /etc/systemd/system/rw-torrent-guard.service "$GUARD_NFT"
