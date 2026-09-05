@@ -45,9 +45,14 @@ Run it with **no arguments** and you get a menu instead of a full install:
    11)  Beszel agent               install and enrol with the hub
    12)  SSH port -> 2224           verified before port 22 is closed
 
+   16)  Torrent guard             nftables: DHT, UDP trackers, BitTorrent ports
+   17)  Speed shaper              >100 Mbit/s for 120s -> 8 Mbit/s
+   18)  Guard status              counters, shaped clients, top talkers
+
    optional
    13)  Zapret (DPI bypass)       download + run zapret's own installer
    14)  DPI check (test 4)        TCP 16-20KB blocking, before/after zapret
+   15)  Find a strategy           zapret blockcheck, with zapret stopped first
 
     0)  Quit
 ```
@@ -275,6 +280,95 @@ Panel side, the inbound needs both a fallback and an ALPN — the docs require
 `xver: 1` sends PROXY protocol so Caddy logs the real client IP — selfsteal's
 Caddyfile already allows it from `127.0.0.1/32`. Use `xver: 0` if anything
 misbehaves.
+
+## Torrent guard and speed shaper
+
+Two things hosting providers care about: torrent traffic leaving your address,
+and one customer eating the uplink. 16 and 17 handle them. Both run as part of a
+full install — unlike zapret, they are non-interactive and stay inside their own
+nftables tables, so they neither fight ufw nor the Remnawave node plugin. Skip
+either with `skipguard=yes` / `skipshaper=yes`.
+
+### Torrent guard (16)
+
+Xray's sniffer only recognises **unencrypted** BitTorrent. A client with
+protocol encryption switched on walks straight past the panel's routing rules,
+which is the gap this closes.
+
+It hooks nftables' `output`, so it sees what the node originates — including
+traffic routed into WARP, which crosses `output` before encapsulation. It drops:
+
+- **UDP tracker announces** — the 8-byte magic `0x41727101980` at the start of
+  the UDP payload
+- **DHT** — the bencode prefixes `d1:ad2:i` (queries) and `d1:rd2:i` (replies)
+- **the classic port ranges** — 6881-6889, 51413, 21413, 17417, 37305, on the
+  opening packet only, so nothing already running is cut off
+
+Replies to your own clients are accepted before any port rule is consulted.
+That matters: an ephemeral source port can legitimately land inside those
+ranges — 51413 sits inside the Windows ephemeral range 49152-65535 — and
+without that ordering a Windows client could have its return traffic dropped.
+
+It drops silently and reports nothing to the panel, so a false positive costs
+one connection rather than locking a customer out. Because it only inspects the
+node-to-internet direction, it works the same on CDN-fronted nodes.
+
+Deliberately **not** included: connection-fanout heuristics. They would catch
+encrypted BitTorrent, but they also catch legitimate applications, and the point
+is to block torrent traffic only.
+
+```bash
+nft list counters table inet rw_torrent_guard
+```
+
+### Speed shaper (17)
+
+A client sustaining more than 100 Mbit/s for longer than 2 minutes is held to
+8 Mbit/s until it goes quiet. nftables does the accounting — one dynamic set of
+client addresses with per-element byte counters, fed from both directions on the
+client-facing ports. `tc` does the enforcement: HTB on the WAN device for
+download, on an ifb for upload.
+
+The trigger is the **combined** rate; the cap is 8 Mbit/s in **each** direction.
+Release is keyed on falling below 4 Mbit/s for 5 minutes rather than below the
+trigger — once shaped, a client that keeps pulling sits at the cap and could
+never drop under 100 Mbit/s again.
+
+| Setting | Default | Argument |
+|---|---|---|
+| trigger rate | 100 Mbit/s | `shapetrigger=` |
+| sustained for | 120 s | `shapefor=` |
+| cap | 8 Mbit/s | `shapecap=` |
+| release below | 4 Mbit/s | `shaperelease=` |
+| release after | 300 s | `shapereleasefor=` |
+| ports metered | 443 | `shapeports=` |
+| shape upload too | yes | `shapeupload=` |
+| never shape | — | `shapeignore=` |
+
+Tunables live in `/etc/rw-shaper.conf`; edit and `systemctl restart rw-shaper`.
+The panel's IP and your current SSH peer are exempted automatically.
+
+Two safety interlocks: private, loopback and CGNAT ranges are never shaped, and
+neither is an address holding more than 200 concurrent connections — that is a
+CDN edge or a large NAT pool, not one customer. The connection count is only
+checked when a shape is imminent, never on the poll tick.
+
+**Set `skipshaper=yes` on CDN-fronted nodes.** Behind a CDN the source address
+on the wire is the edge, so there is nothing per-client to shape.
+`X-Forwarded-For` does not help here: it is an HTTP header, and `tc` classifies
+on IP headers, so a value sitting inside the TCP payload is out of reach. The
+torrent guard still works there in full.
+
+`shapeupload=no` skips the ingress qdisc and the mirred redirect entirely. Worth
+knowing on a busy 1 Gbit node: with upload shaping on, **all** inbound traffic is
+redirected through the ifb device.
+
+```bash
+journalctl -fu rw-shaper
+```
+
+Stopping the service undoes everything it did — tc qdiscs, the nftables table,
+and any classes in place — and puts plain `fq` back on the interface.
 
 ## Panel versions
 

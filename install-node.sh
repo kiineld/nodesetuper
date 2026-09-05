@@ -58,6 +58,25 @@ SKIP_WARP="${SKIP_WARP:-no}"
 WARP_ACCOUNT="${WARP_ACCOUNT:-}"   # wgcf-account.toml  — skips registration
 WARP_PROFILE="${WARP_PROFILE:-}"   # wgcf-profile.conf  — skips registration AND generate
 SKIP_SSH_PORT="${SKIP_SSH_PORT:-no}"
+
+# --- Torrent guard / speed shaper ------------------------------------------
+# Both run as part of a full install. They confine themselves to their own
+# nftables tables, so they neither fight ufw nor the Remnawave node plugin.
+SKIP_TORRENT_GUARD="${SKIP_TORRENT_GUARD:-no}"
+SKIP_SHAPER="${SKIP_SHAPER:-no}"        # set yes on CDN-fronted nodes
+
+# Ports xray exposes to clients. Everything else on the wire — panel, beszel,
+# ssh — is deliberately not measured. configure_ufw opens exactly these.
+SHAPE_PORTS="${SHAPE_PORTS:-443}"
+SHAPE_TRIGGER_MBIT="${SHAPE_TRIGGER_MBIT:-100}"  # sustained rate that trips it
+SHAPE_TRIGGER_SECONDS="${SHAPE_TRIGGER_SECONDS:-120}"
+SHAPE_CAP_MBIT="${SHAPE_CAP_MBIT:-8}"            # what an offender is held to
+SHAPE_RELEASE_MBIT="${SHAPE_RELEASE_MBIT:-4}"    # "gone quiet" threshold
+SHAPE_RELEASE_SECONDS="${SHAPE_RELEASE_SECONDS:-300}"
+SHAPE_UPLOAD="${SHAPE_UPLOAD:-yes}"              # no = shape download only
+SHAPE_MAX_CLIENTS="${SHAPE_MAX_CLIENTS:-64}"
+SHAPE_MAX_CONNS="${SHAPE_MAX_CONNS:-200}"        # above this, assume CDN/CGNAT
+SHAPE_IGNORE_IPS="${SHAPE_IGNORE_IPS:-}"         # space or comma separated
 RUN_MODE="${RUN_MODE:-}"        # menu | all; empty = menu when there are no arguments
 
 # Prompted for if still empty. Declared here so `set -u` never trips on a path
@@ -74,6 +93,9 @@ DPI_LOG_DIR=/var/log/dpi-detector
 INSTALL_DIR="/opt/remnanode"
 XRAY_SSL_DIR="/var/lib/remnawave/configs/xray/ssl"
 LOG_FILE="/var/log/remnanode-autoinstall.log"
+GUARD_NFT="/etc/rw-torrent-guard.nft"
+SHAPER_BIN="/usr/local/bin/rw-shaper"
+SHAPER_CONF="/etc/rw-shaper.conf"
 
 # ---------------------------------------------------------------------------
 # Plumbing
@@ -212,6 +234,14 @@ Usage: install-node.sh [key=value ...]
                           (bkey + btoken skip the hub login entirely)
   System     ipv6=        keep|disable               sshport=  default 2224
              skipwarp=    yes|no                     skipssh=  yes|no
+  Guard      skipguard=   yes|no   skip the nftables torrent guard
+             skipshaper=  yes|no   skip the speed shaper (set on CDN nodes)
+             shapeports=  client-facing ports to meter        default 443
+             shapetrigger=Mbit/s that trips it                default 100
+             shapefor=    seconds it must be sustained        default 120
+             shapecap=    Mbit/s an offender is held to       default 8
+             shapeupload= yes|no   also shape the upload direction
+             shapeignore= addresses never to shape (comma separated)
   WARP       warpprofile= reuse a wgcf-profile.conf (path, URL or base64)
                           — needs no Cloudflare access at all
              warpaccount= reuse a wgcf-account.toml; skips registration, but
@@ -284,6 +314,18 @@ parse_args() {
             warpaccount|wgcfaccount|warpacct)           set_var WARP_ACCOUNT "$val" ;;
             warpprofile|wgcfprofile|warpconf)           set_var WARP_PROFILE "$val" ;;
             skipsshport|skipssh)                        set_var SKIP_SSH_PORT "$val" ;;
+            skiptorrentguard|skipguard|noguard)         set_var SKIP_TORRENT_GUARD "$val" ;;
+            skipshaper|noshaper)                        set_var SKIP_SHAPER "$val" ;;
+            shapeports)                                 set_var SHAPE_PORTS "$val" ;;
+            shapetriggermbit|shapetrigger)              set_var SHAPE_TRIGGER_MBIT "$val" ;;
+            shapetriggerseconds|shapefor)               set_var SHAPE_TRIGGER_SECONDS "$val" ;;
+            shapecapmbit|shapecap)                      set_var SHAPE_CAP_MBIT "$val" ;;
+            shapereleasembit|shaperelease)              set_var SHAPE_RELEASE_MBIT "$val" ;;
+            shapereleaseseconds|shapereleasefor)        set_var SHAPE_RELEASE_SECONDS "$val" ;;
+            shapeupload)                                set_var SHAPE_UPLOAD "$val" ;;
+            shapemaxclients)                            set_var SHAPE_MAX_CLIENTS "$val" ;;
+            shapemaxconns)                              set_var SHAPE_MAX_CONNS "$val" ;;
+            shapeignoreips|shapeignore)                 set_var SHAPE_IGNORE_IPS "$val" ;;
             installdir)                                 set_var INSTALL_DIR "$val" ;;
             *) warn "unknown argument: ${arg%%=*}  (run with --help for the list)" ;;
         esac
@@ -413,6 +455,9 @@ preflight() {
     have ufw  || need+=(ufw)
     have dig  || need+=(dnsutils)
     have ss   || need+=(iproute2)
+    # nftables is a hard requirement of the Remnawave node plugin as well as of
+    # the torrent guard and the shaper's accounting.
+    have nft  || need+=(nftables)
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || need+=(ca-certificates)
     if ((${#need[@]})); then
         info "installing: ${need[*]}"
@@ -1540,6 +1585,550 @@ summary() {
 SUMMARY
 }
 
+# --- Torrent guard ---------------------------------------------------------
+# Xray's sniffer only recognises unencrypted BitTorrent, so a client with
+# protocol encryption switched on walks straight past the panel's routing
+# rules. This closes that gap on the node itself.
+#
+# It hooks `output`, so it sees what the node originates — including traffic
+# routed into WARP, which crosses `output` before encapsulation. Client-facing
+# traffic is accepted up front, which also makes the guard indifferent to
+# whether the node sits behind a CDN.
+#
+# Its own table, `policy accept` plus explicit drops: it cannot interfere with
+# ufw, with Docker's chains, or with the Remnawave node plugin's table.
+install_torrent_guard() {
+    step "Torrent guard (nftables)"
+
+    if ! have nft; then
+        soft_fail "nftables is not installed"
+        return 1
+    fi
+
+    # Ports we must never mistake for torrent traffic. A client's ephemeral
+    # source port can legitimately land inside the BitTorrent ranges — 51413
+    # sits inside the Windows ephemeral range 49152-65535 — so replies to our
+    # own clients are accepted before any port rule is consulted.
+    local svc_ports="${SHAPE_PORTS},${NODE_PORT},${SSH_PORT},${BESZEL_PORT},${SELFSTEAL_PORT},${FALLBACK_PORT}"
+
+    cat > "$GUARD_NFT" <<GUARD
+#!/usr/sbin/nft -f
+# Written by install-node.sh. Reloaded by rw-torrent-guard.service.
+# Blocks what Xray cannot see: DHT, UDP trackers, and the classic BitTorrent
+# port ranges — on traffic this node sends out.
+
+table inet rw_torrent_guard
+delete table inet rw_torrent_guard
+
+table inet rw_torrent_guard {
+    set bt_ports {
+        type inet_service
+        flags interval
+        elements = { 6881-6889, 51413, 21413, 17417, 37305 }
+    }
+
+    counter c_udp_tracker {}
+    counter c_dht {}
+    counter c_ports {}
+
+    chain out {
+        type filter hook output priority 10; policy accept;
+
+        oifname "lo" accept
+        udp dport 53 accept
+        tcp dport 53 accept
+
+        # Replies to our own clients and to the control plane. Must precede
+        # the port rules — see the note above about ephemeral source ports.
+        tcp sport { ${svc_ports} } accept
+        udp sport { ${svc_ports} } accept
+
+        # UDP tracker connect: the 8-byte magic 0x41727101980 at the start of
+        # the UDP payload. The UDP header is 8 bytes, so the payload begins at
+        # bit offset 64 from the transport header.
+        meta l4proto udp @th,64,64 0x0000041727101980 counter name c_udp_tracker drop
+
+        # DHT, bencoded: queries open "d1:ad2:i", replies "d1:rd2:i".
+        # Matched unconditionally — DHT is stateless UDP, so the interesting
+        # packets are not all ct state new.
+        meta l4proto udp @th,64,64 0x64313a6164323a69 counter name c_dht drop
+        meta l4proto udp @th,64,64 0x64313a7264323a69 counter name c_dht drop
+
+        # Port rules apply to the opening packet only: the connection never
+        # establishes, and anything already running is left alone.
+        ct state new tcp dport @bt_ports counter name c_ports drop
+        ct state new udp dport @bt_ports counter name c_ports drop
+    }
+}
+GUARD
+    chmod 644 "$GUARD_NFT"
+
+    if ! nft -c -f "$GUARD_NFT" 2>/tmp/rwguard.err; then
+        soft_fail "the ruleset did not validate: $(tr -d '\n' </tmp/rwguard.err)"
+        info "kernel $(uname -r), nft $(nft --version 2>/dev/null | head -1)"
+        return 1
+    fi
+
+    cat > /etc/systemd/system/rw-torrent-guard.service <<'UNIT'
+[Unit]
+Description=Torrent guard (nftables rules for DHT, UDP trackers, BitTorrent ports)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
+ExecReload=/usr/sbin/nft -f /etc/rw-torrent-guard.nft
+ExecStop=-/usr/sbin/nft delete table inet rw_torrent_guard
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    if systemctl enable --now rw-torrent-guard.service >/dev/null 2>&1; then
+        ok "loaded and enabled at boot"
+    else
+        soft_fail "could not start rw-torrent-guard.service"
+        systemctl status rw-torrent-guard.service --no-pager -l 2>&1 | sed 's/^/       /' | head -15
+        return 1
+    fi
+
+    # Prove the table is actually live rather than trusting the exit code.
+    if nft list table inet rw_torrent_guard >/dev/null 2>&1; then
+        ok "table inet rw_torrent_guard is active"
+    else
+        soft_fail "the service started but the table is not present"
+        return 1
+    fi
+    info "counters:  nft list counters table inet rw_torrent_guard"
+    info "disable:   systemctl disable --now rw-torrent-guard"
+}
+
+# --- Speed shaper ----------------------------------------------------------
+# A client that sustains more than SHAPE_TRIGGER_MBIT for SHAPE_TRIGGER_SECONDS
+# is held to SHAPE_CAP_MBIT until it goes quiet again.
+#
+# nftables does the accounting (one dynamic set of client addresses with
+# per-element byte counters); tc does the enforcement (HTB on the WAN device
+# for download, on an ifb for upload). No fwmark is involved: tc ingress runs
+# before netfilter, so marks are not available on the ifb path, and matching
+# addresses directly in u32 keeps both directions consistent.
+install_speed_shaper() {
+    step "Speed shaper (>${SHAPE_TRIGGER_MBIT} Mbit/s for ${SHAPE_TRIGGER_SECONDS}s -> ${SHAPE_CAP_MBIT} Mbit/s)"
+
+    if ! have nft; then
+        soft_fail "nftables is not installed"
+        return 1
+    fi
+    if ! have tc; then
+        info "installing: iproute2"
+        apt-get install -y -qq iproute2 >/dev/null 2>&1 || true
+    fi
+
+    local wan
+    wan=$(ip -4 route get 1.1.1.1 2>/dev/null \
+          | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    if [[ -z "$wan" ]]; then
+        soft_fail "could not work out which interface faces the internet"
+        return 1
+    fi
+    ok "WAN interface: $wan"
+
+    # The panel must never be shaped, and neither should whoever is currently
+    # logged in over SSH.
+    local ignore="$SHAPE_IGNORE_IPS"
+    [[ -n "$PANEL_IP" ]] && ignore="$ignore $PANEL_IP"
+    [[ -n "${SSH_CLIENT:-}" ]] && ignore="$ignore ${SSH_CLIENT%% *}"
+
+    cat > "$SHAPER_CONF" <<CONF
+# rw-shaper — written by install-node.sh, edit and restart to change.
+#   systemctl restart rw-shaper
+WAN=$wan
+PORTS=$SHAPE_PORTS
+TICK=10
+TRIGGER_MBIT=$SHAPE_TRIGGER_MBIT
+TRIGGER_SECONDS=$SHAPE_TRIGGER_SECONDS
+CAP_MBIT=$SHAPE_CAP_MBIT
+RELEASE_MBIT=$SHAPE_RELEASE_MBIT
+RELEASE_SECONDS=$SHAPE_RELEASE_SECONDS
+SHAPE_UPLOAD=$SHAPE_UPLOAD
+MAX_CLIENTS=$SHAPE_MAX_CLIENTS
+MAX_CONNS=$SHAPE_MAX_CONNS
+IGNORE_IPS="$(printf '%s' "$ignore" | tr ',' ' ' | xargs 2>/dev/null || true)"
+CONF
+    chmod 600 "$SHAPER_CONF"
+
+    materialise_shaper_daemon || return 1
+
+    cat > /etc/systemd/system/rw-shaper.service <<'UNIT'
+[Unit]
+Description=Speed shaper — hold sustained heavy clients to a fixed cap
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rw-shaper
+Restart=always
+RestartSec=5
+# The daemon tears down its own tc qdiscs and nft table on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    if systemctl enable --now rw-shaper.service >/dev/null 2>&1; then
+        ok "running and enabled at boot"
+    else
+        soft_fail "could not start rw-shaper.service"
+        journalctl -u rw-shaper -n 20 --no-pager 2>&1 | sed 's/^/       /'
+        return 1
+    fi
+
+    sleep 2
+    if systemctl is-active --quiet rw-shaper; then
+        ok "trigger ${SHAPE_TRIGGER_MBIT} Mbit/s combined, cap ${SHAPE_CAP_MBIT} Mbit/s each way"
+        [[ "${SHAPE_UPLOAD,,}" == yes ]] \
+            && info "upload shaping on (all inbound traffic crosses an ifb)" \
+            || info "upload shaping off — download only"
+    else
+        soft_fail "rw-shaper exited right after starting"
+        journalctl -u rw-shaper -n 20 --no-pager 2>&1 | sed 's/^/       /'
+        return 1
+    fi
+    info "watch:     journalctl -fu rw-shaper"
+    info "status:    $0  ->  menu option 18"
+}
+
+# Split out from install_speed_shaper purely so neither function is too long to
+# hold in your head at once. The daemon is written verbatim — the quoted
+# heredoc means nothing here is expanded at install time; it reads its settings
+# from /etc/rw-shaper.conf at run time.
+materialise_shaper_daemon() {
+    cat > "$SHAPER_BIN" <<'SHAPER'
+#!/usr/bin/env bash
+# rw-shaper — hold a client that sustains heavy throughput down to a fixed cap.
+#
+# nftables counts bytes per client address; tc enforces. Every threshold is
+# integer bytes-per-second, so there is no floating point anywhere.
+set -uo pipefail
+
+CONF=/etc/rw-shaper.conf
+# shellcheck disable=SC1090
+[[ -r $CONF ]] && . "$CONF"
+
+: "${WAN:=}"
+: "${PORTS:=443}"
+: "${TICK:=10}"
+: "${TRIGGER_MBIT:=100}"
+: "${TRIGGER_SECONDS:=120}"
+: "${CAP_MBIT:=8}"
+: "${RELEASE_MBIT:=4}"
+: "${RELEASE_SECONDS:=300}"
+: "${SHAPE_UPLOAD:=yes}"
+: "${MAX_CLIENTS:=64}"
+: "${MAX_CONNS:=200}"
+: "${IGNORE_IPS:=}"
+
+TABLE=rw_shaper
+IFB=ifb-rwshape
+
+log() { printf '%s rw-shaper: %s\n' "$(date -Is)" "$*"; }
+
+[[ -z $WAN ]] && WAN=$(ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+if [[ -z $WAN ]]; then log "no WAN interface"; exit 1; fi
+
+# 1 Mbit/s = 125000 bytes/s.
+TRIGGER_BPS=$(( TRIGGER_MBIT * 125000 ))
+RELEASE_BPS=$(( RELEASE_MBIT * 125000 ))
+TRIGGER_TICKS=$(( (TRIGGER_SECONDS + TICK - 1) / TICK ))
+RELEASE_TICKS=$(( (RELEASE_SECONDS + TICK - 1) / TICK ))
+UPLOAD=no
+[[ ${SHAPE_UPLOAD,,} == yes ]] && UPLOAD=yes
+
+# HTB needs a ceiling for the root class. A VM often reports no link speed at
+# all, in which case a deliberately huge ceiling keeps the default class from
+# throttling anything.
+link_rate() {
+    local s
+    s=$(cat "/sys/class/net/$WAN/speed" 2>/dev/null || true)
+    if [[ $s =~ ^[0-9]+$ ]] && (( s > 0 )); then printf '%smbit' "$s"; else printf '10gbit'; fi
+}
+
+nft_setup() {
+    nft delete table inet $TABLE 2>/dev/null
+    nft -f - <<NFT
+table inet $TABLE {
+    set clients {
+        type ipv4_addr
+        size 65535
+        flags dynamic,timeout
+        timeout 10m
+        counter
+    }
+    chain meter_in {
+        type filter hook prerouting priority -150; policy accept;
+        iifname "$WAN" tcp dport { $PORTS } update @clients { ip saddr }
+        iifname "$WAN" udp dport { $PORTS } update @clients { ip saddr }
+    }
+    chain meter_out {
+        type filter hook postrouting priority -150; policy accept;
+        oifname "$WAN" tcp sport { $PORTS } update @clients { ip daddr }
+        oifname "$WAN" udp sport { $PORTS } update @clients { ip daddr }
+    }
+}
+NFT
+}
+
+# The default class keeps `fq` as its leaf so BBR still paces normally; only
+# shaped classes get fq_codel, where pacing is not the point.
+tc_setup() {
+    local rate; rate=$(link_rate)
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    tc qdisc add dev "$WAN" root handle 1: htb default 10
+    tc class add dev "$WAN" parent 1: classid 1:1 htb rate "$rate" ceil "$rate"
+    tc class add dev "$WAN" parent 1:1 classid 1:10 htb rate "$rate" ceil "$rate"
+    tc qdisc add dev "$WAN" parent 1:10 handle 10: fq 2>/dev/null
+
+    [[ $UPLOAD == yes ]] || return 0
+    modprobe ifb numifbs=0 2>/dev/null
+    ip link show "$IFB" >/dev/null 2>&1 || ip link add "$IFB" type ifb
+    ip link set "$IFB" up
+    tc qdisc del dev "$WAN" ingress 2>/dev/null
+    tc qdisc add dev "$WAN" handle ffff: ingress
+    tc filter add dev "$WAN" parent ffff: protocol all prio 1 u32 \
+        match u32 0 0 action mirred egress redirect dev "$IFB"
+    tc qdisc del dev "$IFB" root 2>/dev/null
+    tc qdisc add dev "$IFB" root handle 1: htb default 10
+    tc class add dev "$IFB" parent 1: classid 1:1 htb rate "$rate" ceil "$rate"
+    tc class add dev "$IFB" parent 1:1 classid 1:10 htb rate "$rate" ceil "$rate"
+    tc qdisc add dev "$IFB" parent 1:10 handle 10: fq_codel 2>/dev/null
+}
+
+declare -A PREV OVER QUIET CLASSID
+
+# Each shaped address gets its own tc priority as well as its own class, so the
+# filter can be removed later by priority alone — u32 handles are awkward to
+# recover once added.
+alloc_minor() {
+    local m k used
+    for (( m = 100; m < 100 + MAX_CLIENTS; m++ )); do
+        used=no
+        for k in "${!CLASSID[@]}"; do
+            [[ ${CLASSID[$k]} == "$m" ]] && { used=yes; break; }
+        done
+        [[ $used == no ]] && { printf '%s' "$m"; return 0; }
+    done
+    return 1
+}
+
+shape() {  # shape <ip>
+    local ip=$1 m
+    m=$(alloc_minor) || { log "at the $MAX_CLIENTS-client limit, leaving $ip alone"; return 1; }
+    tc class add dev "$WAN" parent 1:1 classid "1:$m" \
+        htb rate "${CAP_MBIT}mbit" ceil "${CAP_MBIT}mbit" 2>/dev/null || return 1
+    tc qdisc add dev "$WAN" parent "1:$m" handle "$m:" fq_codel 2>/dev/null
+    tc filter add dev "$WAN" protocol ip parent 1: prio "$m" u32 \
+        match ip dst "$ip/32" flowid "1:$m" 2>/dev/null || return 1
+    if [[ $UPLOAD == yes ]]; then
+        tc class add dev "$IFB" parent 1:1 classid "1:$m" \
+            htb rate "${CAP_MBIT}mbit" ceil "${CAP_MBIT}mbit" 2>/dev/null
+        tc qdisc add dev "$IFB" parent "1:$m" handle "$m:" fq_codel 2>/dev/null
+        tc filter add dev "$IFB" protocol ip parent 1: prio "$m" u32 \
+            match ip src "$ip/32" flowid "1:$m" 2>/dev/null
+    fi
+    CLASSID[$ip]=$m
+    log "shaping $ip to ${CAP_MBIT}mbit (class 1:$m)"
+}
+
+release() {  # release <ip>
+    local ip=$1
+    local m=${CLASSID[$ip]:-}
+    [[ -z $m ]] && return 0
+    tc filter del dev "$WAN" parent 1: prio "$m" 2>/dev/null
+    tc class del dev "$WAN" classid "1:$m" 2>/dev/null
+    if [[ $UPLOAD == yes ]]; then
+        tc filter del dev "$IFB" parent 1: prio "$m" 2>/dev/null
+        tc class del dev "$IFB" classid "1:$m" 2>/dev/null
+    fi
+    unset "CLASSID[$ip]"
+    log "released $ip"
+}
+
+# Loopback, RFC1918 and CGNAT space, plus anything explicitly exempted.
+ignored() {  # ignored <ip>
+    local ip=$1 x
+    case $ip in
+        0.0.0.0|127.*|10.*|169.254.*|192.168.*)  return 0 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)   return 0 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 0 ;;
+    esac
+    for x in $IGNORE_IPS; do [[ $ip == "$x" ]] && return 0; done
+    return 1
+}
+
+conn_count() { ss -tnH "dst $1" 2>/dev/null | wc -l; }
+
+read_counters() {
+    nft -j list set inet $TABLE clients 2>/dev/null | jq -r '
+        .nftables[]? | .set? // empty | .elem[]? | (.elem // .)
+        | select(type == "object") | select(.counter != null)
+        | "\(.val) \(.counter.bytes)"' 2>/dev/null
+}
+
+teardown() {
+    local ip
+    log "stopping, undoing everything"
+    for ip in "${!CLASSID[@]}"; do release "$ip"; done
+    tc qdisc del dev "$WAN" root 2>/dev/null
+    tc qdisc del dev "$WAN" ingress 2>/dev/null
+    if [[ $UPLOAD == yes ]]; then
+        tc qdisc del dev "$IFB" root 2>/dev/null
+        ip link del "$IFB" 2>/dev/null
+    fi
+    nft delete table inet $TABLE 2>/dev/null
+    # Restore the plain fq that tune_kernel expects to find on the interface.
+    tc qdisc add dev "$WAN" root fq 2>/dev/null
+    exit 0
+}
+trap teardown INT TERM
+
+nft_setup || { log "could not install the accounting table"; exit 1; }
+tc_setup  || { log "could not set up tc"; exit 1; }
+log "watching $WAN ports $PORTS — trigger ${TRIGGER_MBIT}mbit for ${TRIGGER_SECONDS}s, cap ${CAP_MBIT}mbit, release below ${RELEASE_MBIT}mbit for ${RELEASE_SECONDS}s"
+
+while :; do
+    sleep "$TICK"
+    declare -A seen=()
+
+    while read -r ip bytes; do
+        [[ -z ${ip:-} || -z ${bytes:-} ]] && continue
+        seen[$ip]=1
+        prev=${PREV[$ip]:-}
+        PREV[$ip]=$bytes
+        # No previous sample, or the element aged out and came back with a
+        # fresh counter: start again rather than reporting a negative rate.
+        [[ -z $prev ]] && continue
+        (( bytes < prev )) && continue
+        rate=$(( (bytes - prev) / TICK ))
+
+        if [[ -n ${CLASSID[$ip]:-} ]]; then
+            # Already shaped, so the measured rate sits at the cap while they
+            # keep pulling. Release on falling well below it, not below the
+            # trigger, which they can no longer reach.
+            if (( rate < RELEASE_BPS )); then
+                QUIET[$ip]=$(( ${QUIET[$ip]:-0} + 1 ))
+                if (( ${QUIET[$ip]} >= RELEASE_TICKS )); then
+                    release "$ip"; unset "QUIET[$ip]" "OVER[$ip]"
+                fi
+            else
+                QUIET[$ip]=0
+            fi
+            continue
+        fi
+
+        if (( rate < TRIGGER_BPS )); then
+            OVER[$ip]=0
+            continue
+        fi
+
+        OVER[$ip]=$(( ${OVER[$ip]:-0} + 1 ))
+        (( ${OVER[$ip]} < TRIGGER_TICKS )) && continue
+        OVER[$ip]=0
+
+        if ignored "$ip"; then continue; fi
+        # Only checked when a shape is imminent, which is rare. Doing it every
+        # tick would mean walking the whole socket table on a busy node.
+        conns=$(conn_count "$ip")
+        if (( conns > MAX_CONNS )); then
+            log "not shaping $ip: $conns concurrent connections looks like a CDN edge or CGNAT, not one client"
+            continue
+        fi
+        shape "$ip" && QUIET[$ip]=0
+    done < <(read_counters)
+
+    # Drop bookkeeping for addresses that have left the set, so the arrays do
+    # not grow without bound on a long-lived node.
+    for ip in "${!PREV[@]}"; do
+        [[ -n ${seen[$ip]:-} ]] && continue
+        [[ -n ${CLASSID[$ip]:-} ]] && release "$ip"
+        unset "PREV[$ip]" "OVER[$ip]" "QUIET[$ip]"
+    done
+    unset seen
+done
+SHAPER
+    chmod 755 "$SHAPER_BIN"
+    if ! bash -n "$SHAPER_BIN"; then
+        soft_fail "the generated daemon has a syntax error"
+        return 1
+    fi
+    ok "daemon written to $SHAPER_BIN"
+}
+
+# --- Guard status ----------------------------------------------------------
+# One place to answer "is any of this actually doing anything?".
+guard_status() {
+    step "Torrent guard / speed shaper status"
+
+    printf '\n     %sTorrent guard%s\n' "$C_BLU" "$C_RESET"
+    if nft list table inet rw_torrent_guard >/dev/null 2>&1; then
+        ok "table active"
+        nft -j list counters table inet rw_torrent_guard 2>/dev/null | jq -r '
+            .nftables[]? | .counter? // empty
+            | "       \(.name): \(.packets) packets, \(.bytes) bytes"' 2>/dev/null \
+            || nft list counters table inet rw_torrent_guard 2>/dev/null | sed 's/^/       /'
+        info "all three at zero on a busy node means nothing is reaching them —"
+        info "check the panel routing before assuming clients are behaving"
+    else
+        warn "not loaded (menu option 16 installs it)"
+    fi
+
+    printf '\n     %sSpeed shaper%s\n' "$C_BLU" "$C_RESET"
+    if ! systemctl is-active --quiet rw-shaper 2>/dev/null; then
+        warn "rw-shaper is not running (menu option 17 installs it)"
+        return 0
+    fi
+    ok "rw-shaper running"
+
+    local wan=""
+    [[ -r "$SHAPER_CONF" ]] && wan=$(awk -F= '$1=="WAN"{print $2}' "$SHAPER_CONF")
+    [[ -n "$wan" ]] && info "interface: $wan"
+
+    # Classes below 1:10 are the per-offender ones; 1:1 and 1:10 are structural.
+    local shaped
+    shaped=$(tc -s class show dev "$wan" 2>/dev/null \
+             | awk '/class htb 1:1[0-9][0-9]/ {print $3}' | tr '\n' ' ')
+    if [[ -n "${shaped// /}" ]]; then
+        warn "currently shaped classes: $shaped"
+        tc filter show dev "$wan" 2>/dev/null \
+            | grep -Eo 'match [0-9a-f]{8}/ffffffff' | sed 's/^/       /' | head -20
+    else
+        ok "nobody is being shaped right now"
+    fi
+
+    # Two samples two seconds apart turns the running byte counters into rates.
+    if nft list set inet rw_shaper clients >/dev/null 2>&1; then
+        local a b
+        a=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c '[.nftables[]?|.set?//empty|.elem[]?|(.elem//.)|select(.counter!=null)|{(.val|tostring):.counter.bytes}]|add // {}')
+        sleep 2
+        b=$(nft -j list set inet rw_shaper clients 2>/dev/null | jq -c '[.nftables[]?|.set?//empty|.elem[]?|(.elem//.)|select(.counter!=null)|{(.val|tostring):.counter.bytes}]|add // {}')
+        printf '\n     top clients by current throughput\n'
+        jq -rn --argjson a "$a" --argjson b "$b" '
+            [ $b | to_entries[]
+              | select($a[.key] != null and .value >= $a[.key])
+              | {ip: .key, mbit: (((.value - $a[.key]) * 8 / 2 / 1000000) * 10 | round / 10)} ]
+            | sort_by(-.mbit) | .[:10] | .[]
+            | "       \(.ip)  \(.mbit) Mbit/s"' 2>/dev/null \
+            || info "no samples yet"
+    fi
+}
+
 run_all() {
     need_panel
     need_domain
@@ -1563,6 +2152,10 @@ run_all() {
     register_node
     install_warp       || true
     install_beszel     || true
+    # After tune_kernel and install_warp: the shaper takes over the interface's
+    # root qdisc, and the guard wants the WARP interface to already exist.
+    [[ "${SKIP_TORRENT_GUARD,,}" == yes ]] || install_torrent_guard || true
+    [[ "${SKIP_SHAPER,,}" == yes ]]        || install_speed_shaper  || true
     migrate_ssh        || true
     summary
 }
@@ -1814,6 +2407,10 @@ ${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLI
    11)  Beszel agent               install and enrol with the hub
    12)  SSH port -> ${SSH_PORT}            verified before port 22 is closed
 
+   16)  Torrent guard              nftables: DHT, UDP trackers, BitTorrent ports
+   17)  Speed shaper               >${SHAPE_TRIGGER_MBIT} Mbit/s for ${SHAPE_TRIGGER_SECONDS}s -> ${SHAPE_CAP_MBIT} Mbit/s
+   18)  Guard status               counters, shaped clients, top talkers
+
    ${C_YEL}optional${C_RESET}
    13)  Zapret (DPI bypass)       download + run zapret's own installer
    14)  DPI check (test 4)        TCP 16-20KB blocking, before/after zapret
@@ -1828,7 +2425,7 @@ menu() {
     local choice
     while :; do
         show_menu
-        prompt "choose [0-15]: "
+        prompt "choose [0-18]: "
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
@@ -1862,6 +2459,9 @@ menu() {
                 action_done ;;
            14)  run_dpi_check manual || true; action_done ;;
            15)  run_blockcheck || true; action_done ;;
+           16)  install_torrent_guard || true; action_done ;;
+           17)  install_speed_shaper  || true; action_done ;;
+           18)  guard_status || true; action_done ;;
             0|q|quit|exit) printf '
 '; return 0 ;;
             "") ;;
