@@ -78,6 +78,7 @@ SHAPE_UPLOAD="${SHAPE_UPLOAD:-yes}"              # no = shape download only
 SHAPE_MAX_CLIENTS="${SHAPE_MAX_CLIENTS:-64}"
 SHAPE_MAX_CONNS="${SHAPE_MAX_CONNS:-200}"        # above this, assume CDN/CGNAT
 SHAPE_IGNORE_IPS="${SHAPE_IGNORE_IPS:-}"         # space or comma separated
+REMOVE_WHAT="${REMOVE_WHAT:-}"   # shaper | guard | both
 RUN_MODE="${RUN_MODE:-}"        # menu | all; empty = menu when there are no arguments
 
 # Prompted for if still empty. Declared here so `set -u` never trips on a path
@@ -237,6 +238,7 @@ Usage: install-node.sh [key=value ...]
                           (bkey + btoken skip the hub login entirely)
   System     ipv6=        keep|disable               sshport=  default 2224
              skipwarp=    yes|no                     skipssh=  yes|no
+             remove=      shaper|guard|both — uninstall and exit
   Guard      skipguard=   yes|no   skip the nftables torrent guard
              skipshaper=  yes|no   skip the speed shaper (set on CDN nodes)
              shapeports=  client-facing ports to meter        default 443
@@ -329,6 +331,7 @@ parse_args() {
             shapemaxclients)                            set_var SHAPE_MAX_CLIENTS "$val" ;;
             shapemaxconns)                              set_var SHAPE_MAX_CONNS "$val" ;;
             shapeignoreips|shapeignore)                 set_var SHAPE_IGNORE_IPS "$val" ;;
+            remove|uninstall)                           set_var REMOVE_WHAT "$val" ;;
             installdir)                                 set_var INSTALL_DIR "$val" ;;
             *) warn "unknown argument: ${arg%%=*}  (run with --help for the list)" ;;
         esac
@@ -2227,6 +2230,80 @@ SHAPER
     ok "daemon written to $SHAPER_BIN"
 }
 
+# --- Removal ----------------------------------------------------------------
+# Stopping the service is what actually undoes the runtime state: the daemon
+# traps SIGTERM and tears down its own tc qdiscs and nftables table. Everything
+# after that is for the case where it died without getting the chance.
+_wan_iface() {
+    ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+}
+
+# The whitelist is shared, so it only goes once nothing is left that reads it.
+_drop_whitelist_if_orphaned() {
+    systemctl list-unit-files rw-shaper.service >/dev/null 2>&1 && return 0
+    systemctl list-unit-files rw-torrent-guard.service >/dev/null 2>&1 && return 0
+    rm -f "$WHITELIST_BIN" "$WHITELIST_FILE"
+    info "removed $WHITELIST_FILE (nothing reads it any more)"
+}
+
+remove_speed_shaper() {
+    step "Remove speed shaper"
+    local wan; wan=$(_wan_iface)
+
+    if systemctl list-unit-files rw-shaper.service >/dev/null 2>&1; then
+        systemctl disable --now rw-shaper.service >/dev/null 2>&1 || true
+        ok "service stopped and disabled"
+    else
+        info "no rw-shaper service was installed"
+    fi
+
+    rm -f /etc/systemd/system/rw-shaper.service "$SHAPER_BIN" "$SHAPER_CONF"
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Whatever the daemon did or did not clean up on its way out.
+    nft delete table inet rw_shaper 2>/dev/null || true
+    if [[ -n "$wan" ]]; then
+        tc qdisc del dev "$wan" root 2>/dev/null || true
+        tc qdisc del dev "$wan" ingress 2>/dev/null || true
+        # Put back the plain fq that tune_kernel expects on the interface.
+        tc qdisc add dev "$wan" root fq 2>/dev/null || true
+        ok "tc reset on $wan, fq restored"
+    else
+        warn "could not determine the WAN interface — check: tc qdisc show"
+    fi
+    ip link del ifb-rwshape 2>/dev/null || true
+
+    _drop_whitelist_if_orphaned
+    if nft list table inet rw_shaper >/dev/null 2>&1; then
+        soft_fail "the rw_shaper table is still present"
+        return 1
+    fi
+    ok "speed shaper removed"
+}
+
+remove_torrent_guard() {
+    step "Remove torrent guard"
+
+    if systemctl list-unit-files rw-torrent-guard.service >/dev/null 2>&1; then
+        systemctl disable --now rw-torrent-guard.service >/dev/null 2>&1 || true
+        ok "service stopped and disabled"
+    else
+        info "no rw-torrent-guard service was installed"
+    fi
+
+    rm -f /etc/systemd/system/rw-torrent-guard.service "$GUARD_NFT"
+    systemctl daemon-reload 2>/dev/null || true
+    nft delete table inet rw_torrent_guard 2>/dev/null || true
+
+    _drop_whitelist_if_orphaned
+    if nft list table inet rw_torrent_guard >/dev/null 2>&1; then
+        soft_fail "the rw_torrent_guard table is still present"
+        return 1
+    fi
+    ok "torrent guard removed"
+}
+
 # --- Guard status ----------------------------------------------------------
 # One place to answer "is any of this actually doing anything?".
 guard_status() {
@@ -2627,6 +2704,8 @@ ${C_BLU}  Remnawave node setup${C_RESET}  —  $(hostname)${PUBLIC_IP:+  ($PUBLI
    16)  Torrent guard              nftables: DHT, UDP trackers, BitTorrent ports
    17)  Speed shaper               >${SHAPE_TRIGGER_MBIT} Mbit/s for ${SHAPE_TRIGGER_SECONDS}s -> ${SHAPE_CAP_MBIT} Mbit/s
    18)  Guard status               counters, shaped clients, top talkers
+   19)  Remove speed shaper        stop it, undo tc, delete its files
+   20)  Remove torrent guard       stop it, drop the table, delete its files
 
    ${C_YEL}optional${C_RESET}
    13)  Zapret (DPI bypass)       download + run zapret's own installer
@@ -2642,7 +2721,7 @@ menu() {
     local choice
     while :; do
         show_menu
-        prompt "choose [0-18]: "
+        prompt "choose [0-20]: "
         read -r choice < /dev/tty || true
         case "${choice// /}" in
             1)  run_all; return 0 ;;
@@ -2679,6 +2758,8 @@ menu() {
            16)  install_torrent_guard || true; action_done ;;
            17)  install_speed_shaper  || true; action_done ;;
            18)  guard_status || true; action_done ;;
+           19)  remove_speed_shaper || true; action_done ;;
+           20)  remove_torrent_guard || true; action_done ;;
             0|q|quit|exit) printf '
 '; return 0 ;;
             "") ;;
@@ -2697,6 +2778,19 @@ main() {
 ' "=== install-node.sh $(date -Is) ===" >> "$LOG_FILE"
 
     preflight
+
+    # Removal is its own mode: it must not fall through to a full install just
+    # because an argument was given.
+    if [[ -n "$REMOVE_WHAT" ]]; then
+        case "${REMOVE_WHAT,,}" in
+            shaper|shape)  remove_speed_shaper || true ;;
+            guard|torrent) remove_torrent_guard || true ;;
+            both|all)      remove_speed_shaper || true; remove_torrent_guard || true ;;
+            *) die "remove= expects shaper, guard or both (got: $REMOVE_WHAT)" ;;
+        esac
+        summary
+        return 0
+    fi
 
     # No arguments and a terminal to talk to: show the menu. Any argument means
     # you already know what you want, so run the lot.

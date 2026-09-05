@@ -420,6 +420,24 @@ journalctl -fu rw-shaper
 Stopping the service undoes everything it did — tc qdiscs, the nftables table,
 and any classes in place — and puts plain `fq` back on the interface.
 
+### Removing them
+
+Menu options **19** and **20**, or without the menu:
+
+```bash
+bash install-node.sh remove=shaper
+```
+
+`remove=` takes `shaper`, `guard` or `both`, and exits afterwards rather than
+falling through to an install — handy across a fleet.
+
+Removal stops and disables the service, deletes its unit, binary and config,
+then clears up after itself: the daemon tears down its own tc qdiscs and
+nftables table on SIGTERM, and removal repeats that unconditionally in case it
+died without the chance. `fq` goes back on the interface either way. It verifies
+the table is gone rather than assuming, and `/etc/rw-whitelist` is only deleted
+once neither feature is left to read it.
+
 ## Panel versions
 
 `GET /api/keygen` returns the node's key under different names depending on panel
