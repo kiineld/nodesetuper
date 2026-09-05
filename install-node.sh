@@ -68,7 +68,7 @@ SKIP_SHAPER="${SKIP_SHAPER:-no}"        # set yes on CDN-fronted nodes
 # Ports xray exposes to clients. Ranges are fine: the meter also matches on
 # connection direction, so a range overlapping the ephemeral ports (Linux uses
 # 32768-60999) still cannot pick up replies to connections the node itself made.
-SHAPE_PORTS="${SHAPE_PORTS:-443,1443,8443,8444,20000-50000}"
+SHAPE_PORTS="${SHAPE_PORTS:-443,1234,1443,4443,4444,8443,8444,20000-50000}"
 SHAPE_TRIGGER_MBIT="${SHAPE_TRIGGER_MBIT:-100}"  # sustained rate that trips it
 SHAPE_TRIGGER_SECONDS="${SHAPE_TRIGGER_SECONDS:-120}"
 SHAPE_CAP_MBIT="${SHAPE_CAP_MBIT:-8}"            # what an offender is held to
@@ -1898,13 +1898,13 @@ table inet $TABLE {
     # at -200, so the direction is known by the time these rules see a packet.
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
-        iifname "$WAN" ct direction original tcp dport { $PORTS } update @clients { ip saddr }
-        iifname "$WAN" ct direction original udp dport { $PORTS } update @clients { ip saddr }
+        iifname "$WAN" ct direction original tcp dport { $PORTS } update @clients { ip saddr counter }
+        iifname "$WAN" ct direction original udp dport { $PORTS } update @clients { ip saddr counter }
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
-        oifname "$WAN" ct direction reply tcp sport { $PORTS } update @clients { ip daddr }
-        oifname "$WAN" ct direction reply udp sport { $PORTS } update @clients { ip daddr }
+        oifname "$WAN" ct direction reply tcp sport { $PORTS } update @clients { ip daddr counter }
+        oifname "$WAN" ct direction reply udp sport { $PORTS } update @clients { ip daddr counter }
     }
 }
 NFT
@@ -2132,9 +2132,19 @@ guard_status() {
     fi
     ok "rw-shaper running"
 
-    local wan=""
-    [[ -r "$SHAPER_CONF" ]] && wan=$(awk -F= '$1=="WAN"{print $2}' "$SHAPER_CONF")
+    # Read these back from the daemon's own config: the script's defaults may
+    # have moved on since the service was installed, and reporting those would
+    # describe a configuration that is not running.
+    local wan="" ports=""
+    if [[ -r "$SHAPER_CONF" ]]; then
+        wan=$(awk -F= '$1=="WAN"{print $2}' "$SHAPER_CONF")
+        ports=$(awk -F= '$1=="PORTS"{print $2}' "$SHAPER_CONF")
+    fi
     [[ -n "$wan" ]] && info "interface: $wan"
+    [[ -n "$ports" ]] && info "metering ports: $ports"
+    if [[ -n "$ports" && "$ports" != "$SHAPE_PORTS" ]]; then
+        warn "this script would install ${SHAPE_PORTS} — re-run option 17 to update"
+    fi
 
     # Classes below 1:10 are the per-offender ones; 1:1 and 1:10 are structural.
     local shaped
@@ -2174,7 +2184,7 @@ guard_status() {
         if [[ -n "$rows" ]]; then
             printf '%s\n' "$rows"
         else
-            info "no client traffic on ports ${SHAPE_PORTS} during the sample"
+            info "no client traffic on ports ${ports:-$SHAPE_PORTS} during the sample"
         fi
     fi
 }

@@ -216,13 +216,13 @@ table inet rw_shaper {
     }
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
-        iifname $WAN ct direction original tcp dport { $PORTS } update @clients { ip saddr }
-        iifname $WAN ct direction original udp dport { $PORTS } update @clients { ip saddr }
+        iifname $WAN ct direction original tcp dport { $PORTS } update @clients { ip saddr counter }
+        iifname $WAN ct direction original udp dport { $PORTS } update @clients { ip saddr counter }
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
-        oifname $WAN ct direction reply tcp sport { $PORTS } update @clients { ip daddr }
-        oifname $WAN ct direction reply udp sport { $PORTS } update @clients { ip daddr }
+        oifname $WAN ct direction reply tcp sport { $PORTS } update @clients { ip daddr counter }
+        oifname $WAN ct direction reply udp sport { $PORTS } update @clients { ip daddr counter }
     }
 }
 ```
@@ -313,11 +313,13 @@ idempotent re-runs, `|| true` in `run_all` so a failure is recorded in
 Points that must be checked on a real node during implementation rather than
 assumed:
 
-1. **nftables set element counters.** That `update @clients { ip saddr }`
-   increments per-element byte counters on a set declared `counter` is the
-   documented behaviour of dynamic sets, but it has not been confirmed on the
-   target kernels. If it does not hold, the fallback is a named counter per
-   address maintained by explicit rules, or `conntrack -L` accounting.
+1. **nftables set element counters.** Resolved, and the original assumption was
+   wrong. Declaring `counter` in the set definition covers *static* elements
+   only; an element added from the packet path gets a counter only if the
+   update statement asks for one. `update @clients { ip saddr }` therefore
+   created elements with no counter at all, and the reader — which selects on
+   `.counter != null` — saw an empty list while the set itself filled up
+   normally. The correct form is `update @clients { ip saddr counter }`.
 2. **Raw payload offsets.** Confirm `@th,64,64` matches the intended bytes for
    UDP on the target kernel, by generating a DHT query and watching the counter.
    Note that `nft -c -f` is not the tool for this. Check mode cannot resolve

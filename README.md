@@ -355,7 +355,7 @@ never drop under 100 Mbit/s again.
 | cap | 8 Mbit/s | `shapecap=` |
 | release below | 4 Mbit/s | `shaperelease=` |
 | release after | 300 s | `shapereleasefor=` |
-| ports metered | 443, 1443, 8443, 8444, 20000-50000 | `shapeports=` |
+| ports metered | 443, 1234, 1443, 4443, 4444, 8443, 8444, 20000-50000 | `shapeports=` |
 | shape upload too | yes | `shapeupload=` |
 | never shape | — | `shapeignore=` |
 
