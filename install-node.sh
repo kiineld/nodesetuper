@@ -1898,13 +1898,13 @@ table inet $TABLE {
     # at -200, so the direction is known by the time these rules see a packet.
     chain meter_in {
         type filter hook prerouting priority -150; policy accept;
-        iifname "$WAN" ct direction original tcp dport { $PORTS } update @clients { ip saddr counter }
-        iifname "$WAN" ct direction original udp dport { $PORTS } update @clients { ip saddr counter }
+        iifname "$WAN" ct direction original tcp dport { $PORTS } counter update @clients { ip saddr counter } comment "meter-in"
+        iifname "$WAN" ct direction original udp dport { $PORTS } counter update @clients { ip saddr counter } comment "meter-in"
     }
     chain meter_out {
         type filter hook postrouting priority -150; policy accept;
-        oifname "$WAN" ct direction reply tcp sport { $PORTS } update @clients { ip daddr counter }
-        oifname "$WAN" ct direction reply udp sport { $PORTS } update @clients { ip daddr counter }
+        oifname "$WAN" ct direction reply tcp sport { $PORTS } counter update @clients { ip daddr counter } comment "meter-out"
+        oifname "$WAN" ct direction reply udp sport { $PORTS } counter update @clients { ip daddr counter } comment "meter-out"
     }
 }
 NFT
@@ -2157,6 +2157,31 @@ guard_status() {
     else
         ok "nobody is being shaped right now"
     fi
+
+    local refused
+    refused=$(journalctl -u rw-shaper --since "-1h" --no-pager 2>/dev/null \
+              | grep -c 'not shaping' || true)
+    if [[ -n "$refused" ]] && (( refused > 0 )); then
+        warn "$refused refusal(s) to shape in the last hour — journalctl -u rw-shaper | grep 'not shaping'"
+    fi
+
+    # Whether the meter rules are matching at all separates "no traffic on
+    # those ports" from "traffic seen but not attributed", which are very
+    # different faults and used to look identical from here.
+    local meter
+    meter=$(nft -j list table inet rw_shaper 2>/dev/null | jq -r '
+        [ .nftables[]? | .rule? // empty | select(.comment != null)
+          | { tag: .comment,
+              packets: ([ .expr[]? | .counter? // empty | .packets ] | add // 0) } ]
+        | group_by(.tag) | .[]
+        | "       \(.[0].tag): \(map(.packets) | add) packets matched"' 2>/dev/null)
+    if [[ -n "$meter" ]]; then
+        printf '     meter rules\n%s\n' "$meter"
+    fi
+    local tracked
+    tracked=$(nft -j list set inet rw_shaper clients 2>/dev/null \
+              | jq '[ .nftables[]? | .set? // empty | .elem[]? ] | length' 2>/dev/null)
+    [[ -n "$tracked" ]] && info "clients tracked: $tracked"
 
     # Two samples two seconds apart turns the running byte counters into rates.
     # Mind the spaces around `//` here: jq lexes `?//` as the destructuring
