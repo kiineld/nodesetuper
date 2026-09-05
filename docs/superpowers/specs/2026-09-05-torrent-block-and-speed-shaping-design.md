@@ -146,10 +146,6 @@ table inet rw_torrent_guard {
     set bt_ports { type inet_service; flags interval;
                    elements = { 6881-6889, 51413, 21413, 17417, 37305 } }
 
-    counter c_udp_tracker {}
-    counter c_dht {}
-    counter c_ports {}
-
     chain out {
         type filter hook output priority filter + 10; policy accept;
 
@@ -165,17 +161,17 @@ table inet rw_torrent_guard {
         ct direction reply accept
 
         # UDP tracker connect: magic 0x41727101980, 8 bytes at UDP payload start
-        meta l4proto udp @th,64,64 0x0000041727101980 counter name c_udp_tracker drop
+        meta l4proto udp @th,64,64 0x0000041727101980 counter drop comment "udp-tracker"
 
         # DHT query  "d1:ad2:i"
-        meta l4proto udp @th,64,64 0x64313a6164323a69 counter name c_dht drop
+        meta l4proto udp @th,64,64 0x64313a6164323a69 counter drop comment "dht"
         # DHT reply  "d1:rd2:i"
-        meta l4proto udp @th,64,64 0x64313a7264323a69 counter name c_dht drop
+        meta l4proto udp @th,64,64 0x64313a7264323a69 counter drop comment "dht"
 
         # Port rules apply to the first packet only. The connection never
         # establishes, and any pre-existing flow is left alone.
-        ct state new tcp dport @bt_ports counter name c_ports drop
-        ct state new udp dport @bt_ports counter name c_ports drop
+        ct state new tcp dport @bt_ports counter drop comment "bt-ports"
+        ct state new udp dport @bt_ports counter drop comment "bt-ports"
     }
 }
 ```
@@ -185,6 +181,14 @@ is the first 8 bytes of UDP payload.
 
 Payload matching stays unconditional because DHT traffic is stateless UDP where
 the interesting packets are not all `ct state new`.
+
+Counters are anonymous and tagged by comment rather than declared as named
+objects. A rule cannot reference a named counter created in the same
+transaction: nft resolves stateful objects against the committed generation, so
+each such rule fails with ENOENT. Confirmed on Ubuntu 24.04, kernel 6.1.182,
+nft 1.0.9. Named *sets* in the same batch resolve fine — it is specific to
+stateful objects. `guard_status` groups the anonymous counters by comment to
+report the same three totals.
 
 It drops silently and reports nothing to the panel. A false positive therefore
 costs one broken connection, not a locked-out customer. The TCP BitTorrent

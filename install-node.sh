@@ -1624,10 +1624,12 @@ table inet rw_torrent_guard {
         elements = { 6881-6889, 51413, 21413, 17417, 37305 }
     }
 
-    counter c_udp_tracker {}
-    counter c_dht {}
-    counter c_ports {}
-
+    # Anonymous counters, tagged with comments rather than declared as named
+    # objects. A rule cannot reference a named counter created in the same
+    # transaction — nft looks stateful objects up in the committed generation,
+    # so every such rule fails with ENOENT. Anonymous counters belong to the
+    # rule itself, so one atomic load stays possible; guard_status groups them
+    # by comment to report the same three totals.
     chain out {
         type filter hook output priority 10; policy accept;
 
@@ -1650,18 +1652,18 @@ table inet rw_torrent_guard {
         # UDP tracker connect: the 8-byte magic 0x41727101980 at the start of
         # the UDP payload. The UDP header is 8 bytes, so the payload begins at
         # bit offset 64 from the transport header.
-        meta l4proto udp @th,64,64 0x0000041727101980 counter name c_udp_tracker drop
+        meta l4proto udp @th,64,64 0x0000041727101980 counter drop comment "udp-tracker"
 
         # DHT, bencoded: queries open "d1:ad2:i", replies "d1:rd2:i".
         # Matched unconditionally — DHT is stateless UDP, so the interesting
         # packets are not all ct state new.
-        meta l4proto udp @th,64,64 0x64313a6164323a69 counter name c_dht drop
-        meta l4proto udp @th,64,64 0x64313a7264323a69 counter name c_dht drop
+        meta l4proto udp @th,64,64 0x64313a6164323a69 counter drop comment "dht"
+        meta l4proto udp @th,64,64 0x64313a7264323a69 counter drop comment "dht"
 
         # Port rules apply to the opening packet only: the connection never
         # establishes, and anything already running is left alone.
-        ct state new tcp dport @bt_ports counter name c_ports drop
-        ct state new udp dport @bt_ports counter name c_ports drop
+        ct state new tcp dport @bt_ports counter drop comment "bt-ports"
+        ct state new udp dport @bt_ports counter drop comment "bt-ports"
     }
 }
 GUARD
@@ -2101,10 +2103,22 @@ guard_status() {
     printf '\n     %sTorrent guard%s\n' "$C_BLU" "$C_RESET"
     if nft list table inet rw_torrent_guard >/dev/null 2>&1; then
         ok "table active"
-        nft -j list counters table inet rw_torrent_guard 2>/dev/null | jq -r '
-            .nftables[]? | .counter? // empty
-            | "       \(.name): \(.packets) packets, \(.bytes) bytes"' 2>/dev/null \
-            || nft list counters table inet rw_torrent_guard 2>/dev/null | sed 's/^/       /'
+        # The counters are anonymous and live on the rules themselves, so they
+        # are grouped by the rule comment rather than looked up by name.
+        local hits
+        hits=$(nft -j list chain inet rw_torrent_guard out 2>/dev/null | jq -r '
+            [ .nftables[]? | .rule? // empty | select(.comment != null)
+              | { tag:      .comment,
+                  packets: ([ .expr[]? | .counter? // empty | .packets ] | add // 0),
+                  bytes:   ([ .expr[]? | .counter? // empty | .bytes   ] | add // 0) } ]
+            | group_by(.tag) | .[]
+            | "       \(.[0].tag): \(map(.packets) | add) packets, \(map(.bytes) | add) bytes"
+            ' 2>/dev/null)
+        if [[ -n "$hits" ]]; then
+            printf '%s\n' "$hits"
+        else
+            nft list chain inet rw_torrent_guard out 2>/dev/null | sed 's/^/       /'
+        fi
         info "all three at zero on a busy node means nothing is reaching them —"
         info "check the panel routing before assuming clients are behaving"
     else

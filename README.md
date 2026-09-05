@@ -320,8 +320,13 @@ Deliberately **not** included: connection-fanout heuristics. They would catch
 encrypted BitTorrent, but they also catch legitimate applications, and the point
 is to block torrent traffic only.
 
+Counters are anonymous and live on the rules, tagged by comment — a rule cannot
+reference a named counter created in the same transaction, because nft resolves
+stateful objects against the committed generation and every such rule fails with
+ENOENT. Menu option 18 groups them by tag; the raw view is:
+
 ```bash
-nft list counters table inet rw_torrent_guard
+nft list chain inet rw_torrent_guard out
 ```
 
 ### Speed shaper (17)
