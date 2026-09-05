@@ -1776,6 +1776,35 @@ install_speed_shaper() {
     [[ -n "$PANEL_IP" ]] && ignore="$ignore $PANEL_IP"
     [[ -n "${SSH_CLIENT:-}" ]] && ignore="$ignore ${SSH_CLIENT%% *}"
 
+    # On a chained setup, the addresses this node sees as "clients" are the
+    # other nodes feeding it, not people. Shaping one of those would throttle
+    # every user behind it at once, so every node in the panel is exempted.
+    # Read-only, and skipped silently when there are no panel credentials to
+    # hand — the shaper is otherwise usable without the panel.
+    if [[ -n "$PANEL_URL" && -n "$REMNA_TOKEN" ]]; then
+        if rw_api GET /api/nodes && rw_ok; then
+            local addr ip peers=""
+            while read -r addr; do
+                [[ -z "$addr" ]] && continue
+                if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    peers="$peers $addr"
+                else
+                    ip=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+                    [[ -n "$ip" ]] && peers="$peers $ip"
+                fi
+            done < <(printf '%s' "$RW_BODY" | jq -r '.response[]?.address // empty' 2>/dev/null)
+            if [[ -n "${peers// /}" ]]; then
+                ignore="$ignore $peers"
+                ok "exempted $(printf '%s' "$peers" | wc -w | tr -d ' ') node addresses from shaping"
+            fi
+        else
+            warn "could not read the node list — chained nodes will not be exempted"
+        fi
+    else
+        warn "no panel credentials: node addresses are not exempted automatically"
+        info "on a node that other nodes route through, pass shapeignore=<their IPs>"
+    fi
+
     cat > "$SHAPER_CONF" <<CONF
 # rw-shaper — written by install-node.sh, edit and restart to change.
 #   systemctl restart rw-shaper

@@ -367,6 +367,17 @@ neither is an address holding more than 200 concurrent connections — that is a
 CDN edge or a large NAT pool, not one customer. The connection count is only
 checked when a shape is imminent, never on the poll tick.
 
+**Chained nodes.** Where one node routes through another, the addresses an exit
+node sees as "clients" are the entry nodes feeding it, not people. Shaping one
+of those throttles every user behind it at once. The installer reads the node
+list from the panel and exempts every node address automatically; without panel
+credentials it says so, and you should pass `shapeignore=` with their addresses.
+
+The torrent guard belongs on the **exit** node in such a chain. On an entry node
+it sees only an encrypted tunnel to the next hop; the traffic is not decrypted
+into real outbound connections until the exit, which is where DHT, trackers and
+uTP become visible.
+
 **Set `skipshaper=yes` on CDN-fronted nodes.** Behind a CDN the source address
 on the wire is the edge, so there is nothing per-client to shape.
 `X-Forwarded-For` does not help here: it is an HTTP header, and `tc` classifies
