@@ -1660,6 +1660,18 @@ table inet rw_torrent_guard {
         meta l4proto udp @th,64,64 0x64313a6164323a69 counter drop comment "dht"
         meta l4proto udp @th,64,64 0x64313a7264323a69 counter drop comment "dht"
 
+        # uTP connection setup (BEP 29), which is how most clients carry peer
+        # traffic. MSE encrypts the BitTorrent stream inside uTP but not the
+        # uTP header — the transport layer has to read it — so this still
+        # matches with protocol encryption switched on.
+        #
+        # Byte 0 is type<<4 | version, so ST_SYN (type 4) at version 1 is 0x41;
+        # byte 1 is the extension field, 0 when there are none. A SYN carries
+        # no payload, making the datagram exactly 8 + 20 = 28 bytes. That
+        # length requirement is what keeps QUIC out: a QUIC short header can
+        # also begin 0x41, but is never this small.
+        udp length 28 @th,64,16 0x4100 counter drop comment "utp"
+
         # Port rules apply to the opening packet only: the connection never
         # establishes, and anything already running is left alone.
         ct state new tcp dport @bt_ports counter drop comment "bt-ports"
