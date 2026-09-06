@@ -101,7 +101,12 @@ SHAPER_CONF="/etc/rw-shaper.conf"
 BAN_BIN="/usr/local/bin/rw-torrent-ban"
 BAN_CONF="/etc/rw-torrent-ban.conf"
 BAN_SECONDS="${BAN_SECONDS:-600}"
-XRAY_LOG_GLOB="${XRAY_LOG_GLOB:-/var/log/remnanode/*.log}"
+# Two places, because two things can be true. The panel's config profiles
+# normally leave log.access unset, and Xray then writes its access records to
+# the console, which the node image's s6-log pipeline files as
+# /var/log/xray/current. A profile that does set log.access points it at
+# /var/log/remnanode. Both directories are mounted out of the container.
+XRAY_LOG_GLOB="${XRAY_LOG_GLOB:-/var/log/xray/current /var/log/remnanode/*.log}"
 SKIP_BAN="${SKIP_BAN:-no}"
 TRACKER_BIN="/usr/local/bin/rw-tracker-sync"
 TRACKER_LIST_URL="${TRACKER_LIST_URL:-https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all.txt}"
@@ -1123,7 +1128,7 @@ install_remnanode() {
         fi
     fi
 
-    mkdir -p "$INSTALL_DIR" /var/log/remnanode
+    mkdir -p "$INSTALL_DIR" /var/log/remnanode /var/log/xray
 
     {
         echo "services:"
@@ -1145,6 +1150,13 @@ install_remnanode() {
         echo "        soft: 1048576"
         echo "        hard: 1048576"
         echo "    volumes:"
+        # Xray prints its access log to the console unless the panel profile
+        # says otherwise, and the image pipes that through s6-log into
+        # /var/log/xray. Mounting that directory out is what makes those lines
+        # readable on the host, which is where the per-client ban reads them.
+        # The /var/log/remnanode mount stays for profiles that do set
+        # log.access, which conventionally points there.
+        echo "      - /var/log/xray:/var/log/xray"
         echo "      - /var/log/remnanode:/var/log/remnanode"
         if [[ -n "$CERT_PATH" ]]; then
             # Bind the individual files: certmagic rewrites them in place on
@@ -1160,6 +1172,8 @@ install_remnanode() {
     } > "$INSTALL_DIR/docker-compose.yml"
     chmod 600 "$INSTALL_DIR/docker-compose.yml"
 
+    # /var/log/xray is left out on purpose: s6-log rotates that one itself,
+    # at 10MB with no archives kept, and a second rotator would fight it.
     cat > /etc/logrotate.d/remnanode <<'ROTATE'
 /var/log/remnanode/*.log {
     size 50M
@@ -2477,6 +2491,45 @@ UNIT
 }
 
 # --- Torrent ban ------------------------------------------------------------
+# The panel, not the node, decides whether there is an access log to read at
+# all. Xray's config parser switches it off two ways: access "none", and
+# loglevel "none", which clears the access log along with the error log. Both
+# leave this feature with nothing to attribute a ban to, and neither is visible
+# from the node.
+warn_if_xray_logging_off() {  # warn_if_xray_logging_off <config profile uuid>
+    local uuid=$1 log_json level access mask
+    [[ -n "$uuid" ]] || return 0
+    [[ -n "$PANEL_URL" && -n "$REMNA_TOKEN" ]] || return 0
+    rw_api GET /api/config-profiles || return 0
+    rw_ok || return 0
+
+    log_json=$(printf '%s' "$RW_BODY" | jq -c --arg u "$uuid" \
+        '.response.configProfiles[]? | select(.uuid == $u) | .config.log // {}' 2>/dev/null)
+    [[ -n "$log_json" ]] || return 0
+    level=$(printf '%s' "$log_json" | jq -r '.loglevel // "warning"')
+    access=$(printf '%s' "$log_json" | jq -r '.access // empty')
+    mask=$(printf '%s' "$log_json" | jq -r '.maskAddress // empty')
+
+    # maskAddress rewrites client addresses in the log it is supposed to
+    # identify them by, so a ban would land on 1.2.*.* and match nothing.
+    if [[ -n "$mask" ]]; then
+        warn "the profile masks logged addresses (maskAddress: $mask) — nothing to ban"
+    fi
+
+    if [[ "$level" == "none" ]]; then
+        warn "this node's config profile sets loglevel \"none\" — Xray logs nothing"
+        info "nobody can be attributed until that is warning, info or debug"
+    elif [[ "$access" == "none" ]]; then
+        warn "this node's config profile sets access \"none\" — there is no access log"
+        info "clear that field to send access records to the console, where this reads them"
+    elif [[ -n "$access" ]]; then
+        info "the profile writes its access log to $access"
+        [[ "$access" == /var/log/remnanode/* || "$access" == /var/log/xray/* ]] \
+            || warn "that path is not mounted out of the container — the ban cannot read it"
+    fi
+    return 0
+}
+
 # The guard drops torrent packets but cannot say who sent them: on the output
 # hook the source is this node and the source port is ephemeral. Xray's access
 # log is the one place that pairs a client address with the destination it
@@ -2497,20 +2550,31 @@ install_torrent_ban() {
     # Banning an address here cuts every connection from it. If this node is an
     # exit in a chain, the addresses in its access log are the entry nodes, and
     # banning one would disconnect every user behind it at once.
-    local ignore="$SHAPE_IGNORE_IPS"
+    local ignore="$SHAPE_IGNORE_IPS" own_profile=""
     [[ -n "$PANEL_IP" ]] && ignore="$ignore $PANEL_IP"
     [[ -n "${SSH_CLIENT:-}" ]] && ignore="$ignore ${SSH_CLIENT%% *}"
     if [[ -n "$PANEL_URL" && -n "$REMNA_TOKEN" ]] && rw_api GET /api/nodes && rw_ok; then
-        local addr ip
-        while read -r addr; do
+        local addr profile ip
+        while IFS=$'\t' read -r addr profile; do
             [[ -z "$addr" ]] && continue
             if [[ "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                ignore="$ignore $addr"
+                ip="$addr"
             else
-                ip=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-                [[ -n "$ip" ]] && ignore="$ignore $ip"
+                # || true because an address that no longer resolves must not
+                # take the installer down with it under set -e -o pipefail.
+                ip=$(dig +short A "$addr" 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
             fi
-        done < <(printf '%s' "$RW_BODY" | jq -r '.response[]?.address // empty' 2>/dev/null)
+            if [[ -n "$ip" ]]; then
+                ignore="$ignore $ip"
+            fi
+            # Whichever entry is this node names the profile whose log settings
+            # decide whether Xray writes anything for the ban to read.
+            if [[ ( -n "$NODE_DOMAIN" && "$addr" == "$NODE_DOMAIN" ) \
+                  || ( -n "$PUBLIC_IP" && "$ip" == "$PUBLIC_IP" ) ]]; then
+                own_profile="$profile"
+            fi
+        done < <(printf '%s' "$RW_BODY" \
+            | jq -r '.response[]? | "\(.address)\t\(.configProfile.activeConfigProfileUuid // "")"' 2>/dev/null)
         ok "peer nodes exempted from banning"
     else
         warn "no panel credentials — peer nodes are NOT exempt"
@@ -2536,6 +2600,7 @@ carries neither. One matching line is enough: the address goes into an
 nftables set with a timeout and every connection from it is refused until the
 element expires.
 """
+import glob as globlib
 import ipaddress
 import os
 import re
@@ -2547,6 +2612,11 @@ CONF = "/etc/rw-torrent-ban.conf"
 WHITELIST = "/etc/rw-whitelist"
 HOSTS = "/var/lib/rw-tracker-sync/hosts.txt"
 TABLE = ("inet", "rw_torrent_guard")
+CONTAINER = "remnanode"
+PATTERNS = "/var/log/xray/current /var/log/remnanode/*.log"
+# Where the node image's s6-log pipeline files everything Xray prints, from
+# inside the container. Only visible on the host if the compose file mounts it.
+CONSOLE_LOG = "/var/log/xray/current"
 
 # 2023/11/22 17:01:32 1.2.3.4:11421 accepted tcp:tracker.example:6969 [in >> out]
 LINE = re.compile(
@@ -2594,16 +2664,43 @@ def load_hosts():
         return set()
 
 
+def mounted(dest):
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "-f", "{{range .Mounts}}{{.Destination}}\n{{end}}",
+             CONTAINER], capture_output=True)
+    except OSError:
+        return False
+    return dest in r.stdout.decode().split()
+
+
+def log_source(patterns):
+    """The shell command that streams Xray's log, and what to call it.
+
+    Host files are preferred: tail -F waits for a name that does not exist
+    yet, so a container that has not written its first line is still picked
+    up. That needs the log directory mounted out, which containers created
+    before that mount existed do not have — read the same file through docker
+    exec for those. That stream dies when the container restarts, and systemd
+    restarts this service, which reattaches.
+    """
+    if any(globlib.glob(pat) for pat in patterns.split()) or mounted("/var/log/xray"):
+        return "exec tail -F -n0 %s" % patterns, patterns
+    return ("exec docker exec %s tail -F -n0 %s" % (CONTAINER, CONSOLE_LOG),
+            "%s:%s" % (CONTAINER, CONSOLE_LOG))
+
+
 def main():
     cfg = load_conf()
     seconds = int(cfg.get("BAN_SECONDS", "600"))
-    glob = cfg.get("LOG_GLOB", "/var/log/remnanode/*.log")
+    patterns = cfg.get("LOG_GLOB", PATTERNS)
     bt_ports = {p for p in cfg.get("BT_PORTS", "").split(",") if p}
     ignores = load_ignores(cfg)
     hosts = load_hosts()
     hosts_stamp = 0.0
+    cmd, where = log_source(patterns)
     log("watching %s — ban %ds, %d tracker hostnames, %d exempt addresses"
-        % (glob, seconds, len(hosts), len(ignores)))
+        % (where, seconds, len(hosts), len(ignores)))
 
     banned_until = {}
 
@@ -2629,8 +2726,9 @@ def main():
         else:
             log("could not ban %s: %s" % (ip, r.stderr.decode().strip()))
 
-    # tail -F rides out log rotation, which copytruncate makes frequent here.
-    tail = subprocess.Popen("exec tail -F -n0 %s 2>/dev/null" % glob,
+    # tail -F rides out rotation, which both s6-log and copytruncate make
+    # frequent here.
+    tail = subprocess.Popen("%s 2>/dev/null" % cmd,
                             shell=True, stdout=subprocess.PIPE)
     for raw in tail.stdout:
         line = raw.decode("utf-8", "replace")
@@ -2695,14 +2793,23 @@ UNIT
         return 1
     fi
 
-    local found
-    found=$(compgen -G "$XRAY_LOG_GLOB" 2>/dev/null | head -1)
-    if [[ -z "$found" ]]; then
-        warn "no log files match $XRAY_LOG_GLOB yet"
-        info "Xray must be writing an access log there or nothing can be attributed"
+    local files="" pat
+    for pat in $XRAY_LOG_GLOB; do
+        files+=" $(compgen -G "$pat" 2>/dev/null | tr '\n' ' ' || true)"
+    done
+    if [[ -n "${files// /}" ]]; then
+        ok "reading $(printf '%s' "$files" | wc -w | tr -d ' ') log file(s) on the host"
+    elif docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' remnanode 2>/dev/null \
+            | grep -qw '/var/log/xray'; then
+        ok "nothing logged yet — the daemon is waiting on /var/log/xray/current"
+    elif docker inspect remnanode >/dev/null 2>&1; then
+        warn "this container predates the /var/log/xray mount, so the log stays inside it"
+        info "the daemon reads it through 'docker exec' — re-run option 2 to mount it out"
     else
-        ok "reading $(compgen -G "$XRAY_LOG_GLOB" | wc -l | tr -d ' ') log file(s)"
+        warn "no log files and no remnanode container — nothing can be attributed"
     fi
+
+    warn_if_xray_logging_off "$own_profile"
 }
 
 # --- Removal ----------------------------------------------------------------

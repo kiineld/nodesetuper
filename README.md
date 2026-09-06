@@ -348,9 +348,22 @@ destination is a known tracker hostname, whose port is a BitTorrent port, or
 whose outbound tag contains TORRENT. The address goes into an nftables set with
 a timeout, so bans expire without anything having to clean up after them.
 
-**This needs Xray to be writing an access log** to `/var/log/remnanode/`, which
-the node already mounts. With no access log there is nothing to attribute and
-the daemon says so on startup.
+**Where that log actually is.** A config profile normally leaves `log.access`
+unset, and Xray then writes its access records to the console. The node image
+pipes the console through `s6-log` into `/var/log/xray/current` *inside the
+container* — which is why nothing ever turned up under `/var/log/remnanode`.
+The compose file mounts `/var/log/xray` out to the host, and the ban reads
+`/var/log/xray/current` along with `/var/log/remnanode/*.log`, where a profile
+that does set `log.access` conventionally points. A container created before
+that mount existed keeps its log to itself; the daemon reads that one through
+`docker exec` until the container is recreated with option 2. `XRAY_LOG_GLOB`
+overrides the paths.
+
+**A profile with `loglevel: "none"` has no access log at all** — Xray's config
+parser clears the access log along with the error log at that level, whatever
+`log.access` says. The installer looks up the profile this node runs and warns
+when that is the case; nothing can be attributed until the level is `warning`,
+`info` or `debug`.
 
 **Exemptions matter more here than anywhere else.** A ban cuts every connection
 from an address, and on an exit node the addresses in the access log are your
