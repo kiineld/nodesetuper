@@ -3212,6 +3212,8 @@ install_zapret() {
         warn "check: systemctl status zapret; journalctl -u zapret -n 30"
     fi
     info "to search for a working strategy, run: $ZAPRET_DIR/blockcheck.sh"
+    info "to measure the effect, run the DPI check (14) — ideally once before"
+    info "this install and once now, so you have both numbers to compare"
     return 0
 }
 
@@ -3333,13 +3335,7 @@ menu() {
            11)  need_domain; need_beszel; beszel_login || true
                 install_beszel || true; action_done ;;
            12)  migrate_ssh || true; action_done ;;
-           13)  run_dpi_check before || true
-                install_zapret || true
-                if systemctl is-active --quiet zapret 2>/dev/null; then
-                    info "re-checking with zapret active"
-                    run_dpi_check after || true
-                fi
-                action_done ;;
+           13)  install_zapret || true; action_done ;;
            14)  run_dpi_check manual || true; action_done ;;
            15)  run_blockcheck || true; action_done ;;
            16)  install_torrent_guard || true; action_done ;;

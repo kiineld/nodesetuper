@@ -70,10 +70,11 @@ variable's current value as that question's default, and the shipped default is
 zapret installed with every mode switched off and a service that will not start.
 Seeded, the answers are already right — including `IFACE_LAN=` (NONE), since
 picking a real interface there sets up router forwarding rules a VPS does not
-want. An existing config is preserved across a reinstall rather than reset. It runs the DPI check before
-installing (a baseline, since an active bypass distorts the reading) and again
-afterwards if the service comes up. For tuning the strategy itself, zapret ships
-`blockcheck.sh`, which is the tool for that job; the path is printed at the end.
+want. An existing config is preserved across a reinstall rather than reset. It
+installs and nothing else: to measure the effect, run the DPI check (14) once
+before this and once after, since an active bypass distorts the reading. For
+tuning the strategy itself, zapret ships `blockcheck.sh`, which is the tool for
+that job; the path is printed at the end.
 
 Option 14 runs test 4 of
 [dpi-detector](https://github.com/Runnin4ik/dpi-detector) — TCP 16-20KB
